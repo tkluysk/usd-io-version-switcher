@@ -25,7 +25,7 @@ list_versions() {
         VERSION_ROOTS+=("$darwin_root")
         echo "  $i) $label"
         ((i++))
-    done < <(find "$BUILDS_DIR" -maxdepth 1 -mindepth 1 -type d -print0 | sort -z)
+    done < <(find "$BUILDS_DIR" -maxdepth 1 -mindepth 1 -type d | sort -Vr | tr '\n' '\0')
 }
 
 current_version() {
