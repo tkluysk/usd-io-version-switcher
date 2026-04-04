@@ -80,7 +80,11 @@ remove_installed() {
 log_cp() {
     local flag="$1" src="$2" dst="$3"
     echo "  cp $src -> $dst"
-    cp "$flag" "$src" "$dst"
+    if [[ -n "$flag" ]]; then
+        cp "$flag" "$src" "$dst"
+    else
+        cp "$src" "$dst"
+    fi
 }
 
 install_035() {
