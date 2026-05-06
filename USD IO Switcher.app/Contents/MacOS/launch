@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+SCRIPT_DIR="/Users/tkluysk/Documents/repos/usd-io-version-switcher"
+osascript \
+  -e 'tell application "Terminal"' \
+  -e '  activate' \
+  -e "  do script \"'$SCRIPT_DIR/switch-version.sh'\"" \
+  -e 'end tell'
