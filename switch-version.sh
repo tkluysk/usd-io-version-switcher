@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BUILDS_DIR="$(cd "$(dirname "$0")/builds" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LOCAL_BUILDS_DIR="$SCRIPT_DIR/builds"
+DRIVE_BUILDS_DIR="/Users/tkluysk/Library/CloudStorage/GoogleDrive-tom_kluyskens@trimble.com/Shared drives/CDG Projects & Clients/JCube/OEM • USD IO/Deliverables"
+DRIVE_CACHE_DIR="$SCRIPT_DIR/.drive-cache"
+
+BUILDS_DIR=""
+SOURCE_MODE=""  # "local" or "drive"
 
 SKETCHUP_APPS=(
     '/Applications/SketchUp 2026/SketchUp 26.2.app'
@@ -51,18 +57,106 @@ pick_sketchup() {
     fi
 }
 
+pick_source() {
+    local local_ok=0 drive_ok=0
+    [[ -d "$LOCAL_BUILDS_DIR" ]] && local_ok=1
+    [[ -d "$DRIVE_BUILDS_DIR" ]] && drive_ok=1
+
+    if (( local_ok && ! drive_ok )); then
+        SOURCE_MODE="local"; BUILDS_DIR="$LOCAL_BUILDS_DIR"; return
+    fi
+    if (( drive_ok && ! local_ok )); then
+        SOURCE_MODE="drive"; BUILDS_DIR="$DRIVE_BUILDS_DIR"; return
+    fi
+    (( local_ok || drive_ok )) || die "Neither local builds dir ($LOCAL_BUILDS_DIR) nor Drive dir ($DRIVE_BUILDS_DIR) found."
+
+    echo "Select source:"
+    echo "  1) Local builds folder ($LOCAL_BUILDS_DIR)"
+    echo "  2) Google Drive (OEM • USD IO/Deliverables)"
+    echo ""
+    read -rp "Select source [1-2]: " choice
+    case "$choice" in
+        1) SOURCE_MODE="local"; BUILDS_DIR="$LOCAL_BUILDS_DIR" ;;
+        2) SOURCE_MODE="drive"; BUILDS_DIR="$DRIVE_BUILDS_DIR" ;;
+        *) die "Invalid selection: $choice" ;;
+    esac
+}
+
+# Returns a Darwin root directory for the given version folder, extracting from
+# a zip into the drive cache on demand when in drive mode.
+resolve_darwin_root() {
+    local dir="$1"
+    local darwin_root
+    darwin_root=$(find "$dir" -maxdepth 1 -type d -name "*Darwin*" 2>/dev/null | head -1)
+    if [[ -n "$darwin_root" ]]; then
+        echo "$darwin_root"; return 0
+    fi
+
+    if [[ "$SOURCE_MODE" == "drive" ]]; then
+        local zip
+        zip=$(find "$dir" -maxdepth 1 -type f -name "*Darwin*.zip" 2>/dev/null | head -1)
+        [[ -z "$zip" ]] && return 1
+
+        local label cache
+        # Use the dir path relative to the drive root as a stable cache key
+        label="${dir#$DRIVE_BUILDS_DIR/}"
+        cache="$DRIVE_CACHE_DIR/${label//\//__}"
+        darwin_root=$(find "$cache" -maxdepth 1 -type d -name "*Darwin*" 2>/dev/null | head -1)
+        if [[ -z "$darwin_root" ]]; then
+            mkdir -p "$cache"
+            echo "  extracting $(basename "$zip") -> .drive-cache/$label/" >&2
+            unzip -q -o "$zip" -d "$cache" >&2 || return 1
+            darwin_root=$(find "$cache" -maxdepth 1 -type d -name "*Darwin*" 2>/dev/null | head -1)
+        fi
+        [[ -n "$darwin_root" ]] && echo "$darwin_root" && return 0
+    fi
+    return 1
+}
+
+list_drive_entry() {
+    local dir="$1" label="$2"
+    if find "$dir" -maxdepth 1 \( -type d -name "*Darwin*" -o -type f -name "*Darwin*.zip" \) 2>/dev/null | grep -q .; then
+        VERSIONS+=("$label")
+        VERSION_ROOTS+=("$dir")
+        return 0
+    fi
+    return 1
+}
+
 list_versions() {
-    local i=1
+    local idx=1 added
     while IFS= read -r -d '' dir; do
-        local darwin_root
-        darwin_root=$(find "$dir" -maxdepth 1 -type d -name "*Darwin*" | head -1)
-        [[ -z "$darwin_root" ]] && continue
         local label
         label=$(basename "$dir")
-        VERSIONS+=("$label")
-        VERSION_ROOTS+=("$darwin_root")
-        echo "  $i) $label"
-        ((i++))
+        if [[ "$SOURCE_MODE" == "drive" ]]; then
+            # Skip anything older than 0.4.0
+            if [[ "$label" =~ [[:space:]]0\.([0-3])\. ]] || [[ "$label" =~ [[:space:]]0\.[0-3]$ ]]; then
+                continue
+            fi
+            added=0
+            if list_drive_entry "$dir" "$label"; then
+                echo "  $idx) $label"
+                ((idx++)); added=1
+            fi
+            if (( ! added )); then
+                # Descend one level for variant subfolders (e.g. "Using SketchUp libs")
+                while IFS= read -r -d '' sub; do
+                    local sublabel="$label / $(basename "$sub")"
+                    if list_drive_entry "$sub" "$sublabel"; then
+                        echo "  $idx) $sublabel"
+                        ((idx++))
+                    fi
+                done < <(find "$dir" -maxdepth 1 -mindepth 1 -type d | sort -V | tr '\n' '\0')
+            fi
+        else
+            local darwin_root
+            darwin_root=$(find "$dir" -maxdepth 1 -type d -name "*Darwin*" | head -1)
+            [[ -z "$darwin_root" ]] && continue
+            VERSIONS+=("$label")
+            VERSION_ROOTS+=("$darwin_root")
+            echo "  $idx) $label"
+            ((idx++))
+        fi
     done < <(find "$BUILDS_DIR" -maxdepth 1 -mindepth 1 -type d | sort -Vr | tr '\n' '\0')
 }
 
@@ -80,6 +174,7 @@ current_version() {
 shorten() {
     local path="$1"
     path="${path/#$BUILDS_DIR\//}"
+    path="${path/#$DRIVE_CACHE_DIR\//.drive-cache/}"
     path="${path/#$HOME\//~/}"
     if [[ "$path" =~ (SkpXyz-[^/]+/.+) ]]; then
         path=".../${BASH_REMATCH[1]}"
@@ -194,17 +289,19 @@ install_version() {
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
-[[ -d "$BUILDS_DIR" ]] || die "Builds directory not found at: $BUILDS_DIR"
-
 echo ""
 echo "USD IO Version Switcher"
 echo "========================"
 echo ""
 
+pick_source
+[[ -d "$BUILDS_DIR" ]] || die "Builds directory not found at: $BUILDS_DIR"
+
+echo ""
 pick_sketchup
 
 echo ""
-echo "Available versions:"
+echo "Available versions (source: $SOURCE_MODE):"
 list_versions
 echo ""
 
@@ -224,5 +321,9 @@ for SKETCHUP_APP in "${SKETCHUP_TARGETS[@]}"; do
     echo ""
     echo ">>> $(basename "$SKETCHUP_APP")"
     echo "    Currently installed: $(current_version)"
-    install_version "${VERSIONS[$idx]}" "${VERSION_ROOTS[$idx]}"
+    root="${VERSION_ROOTS[$idx]}"
+    if [[ "$SOURCE_MODE" == "drive" ]]; then
+        root=$(resolve_darwin_root "$root") || die "Could not extract Darwin build for ${VERSIONS[$idx]}"
+    fi
+    install_version "${VERSIONS[$idx]}" "$root"
 done
