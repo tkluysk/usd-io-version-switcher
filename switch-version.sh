@@ -62,6 +62,9 @@ pick_source() {
     [[ -d "$LOCAL_BUILDS_DIR" ]] && local_ok=1
     [[ -d "$DRIVE_BUILDS_DIR" ]] && drive_ok=1
 
+    # Resolve symlinks so find works correctly
+    (( local_ok )) && LOCAL_BUILDS_DIR="$(cd "$LOCAL_BUILDS_DIR" && pwd -P)"
+
     if (( local_ok && ! drive_ok )); then
         SOURCE_MODE="local"; BUILDS_DIR="$LOCAL_BUILDS_DIR"; return
     fi
@@ -149,6 +152,9 @@ list_versions() {
                 done < <(find "$dir" -maxdepth 1 -mindepth 1 -type d | sort -V | tr '\n' '\0')
             fi
         else
+            if [[ "$label" =~ [[:space:]]0\.([0-3])\. ]] || [[ "$label" =~ [[:space:]]0\.[0-3]$ ]]; then
+                continue
+            fi
             local darwin_root
             darwin_root=$(find "$dir" -maxdepth 1 -type d -name "*Darwin*" | head -1)
             [[ -z "$darwin_root" ]] && continue
