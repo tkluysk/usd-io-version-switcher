@@ -3,8 +3,8 @@
 to the Google Drive Deliverables folder (via the Drive REST API).
 
 Setup (one-time):
-  python3 sync-releases.py --auth
-  Follow the browser prompt, paste the code back. Credentials are stored at
+  python3 sync-releases.py --auth --client-secret ~/Downloads/client_secret_*.json
+  Sign in as tom_kluyskens@trimble.com in the browser. Credentials stored at
   ~/.config/usd-switcher/gdrive-credentials.json
 
 GitLab token (needs read_api + read_repository scope):
@@ -36,12 +36,7 @@ DELIVERABLES_FOLDER_ID = "1uh930UJISCCTwvV1Xk2Fdgo7Y_I-D8zH"
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
-# OAuth client — installed-app credentials for this tool.
-# Create at https://console.cloud.google.com/ → APIs & Services → Credentials
-# → Create Credentials → OAuth client ID → Desktop app
-# Then paste client_id and client_secret below (or set env vars).
-CLIENT_ID     = os.environ.get("GDRIVE_CLIENT_ID", "")
-CLIENT_SECRET = os.environ.get("GDRIVE_CLIENT_SECRET", "")
+CLIENT_SECRET_FILE = Path.home() / ".config" / "usd-switcher" / "gdrive-client-secret.json"
 
 
 # ── Drive auth ────────────────────────────────────────────────────────────────
@@ -53,10 +48,11 @@ def _gdrive_service():
 
     if GDRIVE_CREDS_FILE.exists():
         creds = Credentials.from_authorized_user_file(str(GDRIVE_CREDS_FILE), SCOPES)
-        if creds.expired and creds.refresh_token:
-            from google.auth.transport.requests import Request
-            creds.refresh(Request())
-            _save_creds(creds)
+        if not creds.valid:
+            if creds.expired and creds.refresh_token:
+                from google.auth.transport.requests import Request
+                creds.refresh(Request())
+                _save_creds(creds)
         return build("drive", "v3", credentials=creds)
 
     raise RuntimeError(
@@ -70,29 +66,25 @@ def _save_creds(creds):
     GDRIVE_CREDS_FILE.chmod(0o600)
 
 
-def do_auth():
+def do_auth(client_secret_path: Path | None = None):
     from google_auth_oauthlib.flow import InstalledAppFlow
 
-    if not CLIENT_ID or not CLIENT_SECRET:
+    src = client_secret_path or CLIENT_SECRET_FILE
+    if not src.exists():
         print(
-            "Set $GDRIVE_CLIENT_ID and $GDRIVE_CLIENT_SECRET before running --auth.\n"
-            "Create OAuth Desktop credentials at:\n"
-            "  https://console.cloud.google.com/ → APIs & Services → Credentials"
+            f"Client secret file not found: {src}\n"
+            "Pass it with:  python3 sync-releases.py --auth --client-secret <path>\n"
+            "Download it from: https://console.cloud.google.com/ → APIs & Services → Credentials"
         )
         sys.exit(1)
 
-    client_config = {
-        "installed": {
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-            "redirect_uris": ["urn:ietf:wg:oauth:2.0:oob", "http://localhost"],
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token",
-        }
-    }
-    flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
+    flow = InstalledAppFlow.from_client_secrets_file(str(src), SCOPES)
     creds = flow.run_local_server(port=0)
     _save_creds(creds)
+    # Also copy the client secret to config dir for future token refreshes
+    import shutil
+    CLIENT_SECRET_FILE.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, CLIENT_SECRET_FILE)
     print(f"Credentials saved to {GDRIVE_CREDS_FILE}")
 
 
@@ -284,10 +276,12 @@ def main():
     ap = argparse.ArgumentParser(description="Sync SkpXyz releases from wiki to Drive.")
     ap.add_argument("--auth", action="store_true",
                     help="Run OAuth flow to store Drive credentials.")
+    ap.add_argument("--client-secret", metavar="PATH",
+                    help="Path to Google OAuth client secret JSON (only needed for --auth).")
     args = ap.parse_args()
 
     if args.auth:
-        do_auth()
+        do_auth(Path(args.client_secret) if args.client_secret else None)
         return
 
     try:
