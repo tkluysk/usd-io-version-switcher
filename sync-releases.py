@@ -1,56 +1,182 @@
 #!/usr/bin/env python3
-"""Sync the latest SkpXyz Darwin-Release zip from the t-support GitLab wiki
-to the local Google Drive Deliverables folder.
+"""Sync the latest SkpXyz release zips from the t-support GitLab wiki
+to the Google Drive Deliverables folder (via the Drive REST API).
 
-Token (needs read_api + read_repository scope):
+Setup (one-time):
+  python3 sync-releases.py --auth
+  Follow the browser prompt, paste the code back. Credentials are stored at
+  ~/.config/usd-switcher/gdrive-credentials.json
+
+GitLab token (needs read_api + read_repository scope):
   File:    ~/.config/usd-switcher/gitlab-token  (one line)
   Env var: GITLAB_WIKI_TOKEN
 
-Wiki is sparse-cloned at ~/.cache/usd-switcher/wiki/ — only Installation.md
-is fetched initially; zip blobs are pulled on demand.
+Wiki is sparse-cloned at ~/.cache/usd-switcher/wiki/
 """
 from __future__ import annotations
 
+import argparse
+import io
+import json
 import os
 import re
 import subprocess
 import sys
 from pathlib import Path
 
-WIKI_URL = "https://oauth2:{token}@gitlab.com/jcube/t-support.wiki.git"
-WIKI_DIR = Path.home() / ".cache" / "usd-switcher" / "wiki"
-TOKEN_FILE = Path.home() / ".config" / "usd-switcher" / "gitlab-token"
+# ── paths & constants ─────────────────────────────────────────────────────────
 
-DELIVERABLES_DIR = (
-    Path.home()
-    / "Library/CloudStorage"
-    / "GoogleDrive-tom_kluyskens@trimble.com"
-    / "Shared drives"
-    / "CDG Projects & Clients"
-    / "JCube"
-    / "OEM • USD IO"
-    / "Deliverables"
-)
+WIKI_URL       = "https://oauth2:{token}@gitlab.com/jcube/t-support.wiki.git"
+WIKI_DIR       = Path.home() / ".cache" / "usd-switcher" / "wiki"
+GITLAB_TOKEN_FILE = Path.home() / ".config" / "usd-switcher" / "gitlab-token"
+GDRIVE_CREDS_FILE = Path.home() / ".config" / "usd-switcher" / "gdrive-credentials.json"
+
+# Drive folder ID for the Deliverables folder
+DELIVERABLES_FOLDER_ID = "1uh930UJISCCTwvV1Xk2Fdgo7Y_I-D8zH"
+
+SCOPES = ["https://www.googleapis.com/auth/drive"]
+
+# OAuth client — installed-app credentials for this tool.
+# Create at https://console.cloud.google.com/ → APIs & Services → Credentials
+# → Create Credentials → OAuth client ID → Desktop app
+# Then paste client_id and client_secret below (or set env vars).
+CLIENT_ID     = os.environ.get("GDRIVE_CLIENT_ID", "")
+CLIENT_SECRET = os.environ.get("GDRIVE_CLIENT_SECRET", "")
 
 
-# ── token ─────────────────────────────────────────────────────────────────────
+# ── Drive auth ────────────────────────────────────────────────────────────────
 
-def read_token() -> str:
-    tok = os.environ.get("GITLAB_WIKI_TOKEN", "").strip()
-    if tok:
-        return tok
-    if TOKEN_FILE.exists():
-        tok = TOKEN_FILE.read_text().strip()
-        if tok:
-            return tok
+def _gdrive_service():
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from googleapiclient.discovery import build
+
+    if GDRIVE_CREDS_FILE.exists():
+        creds = Credentials.from_authorized_user_file(str(GDRIVE_CREDS_FILE), SCOPES)
+        if creds.expired and creds.refresh_token:
+            from google.auth.transport.requests import Request
+            creds.refresh(Request())
+            _save_creds(creds)
+        return build("drive", "v3", credentials=creds)
+
     raise RuntimeError(
-        f"No token found. Set $GITLAB_WIKI_TOKEN or write it to {TOKEN_FILE}"
+        "Not authenticated. Run:  python3 sync-releases.py --auth"
     )
 
 
-# ── git ───────────────────────────────────────────────────────────────────────
+def _save_creds(creds):
+    GDRIVE_CREDS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    GDRIVE_CREDS_FILE.write_text(creds.to_json())
+    GDRIVE_CREDS_FILE.chmod(0o600)
 
-def _git(args: list[str], cwd: Path, check: bool = True) -> subprocess.CompletedProcess:
+
+def do_auth():
+    from google_auth_oauthlib.flow import InstalledAppFlow
+
+    if not CLIENT_ID or not CLIENT_SECRET:
+        print(
+            "Set $GDRIVE_CLIENT_ID and $GDRIVE_CLIENT_SECRET before running --auth.\n"
+            "Create OAuth Desktop credentials at:\n"
+            "  https://console.cloud.google.com/ → APIs & Services → Credentials"
+        )
+        sys.exit(1)
+
+    client_config = {
+        "installed": {
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "redirect_uris": ["urn:ietf:wg:oauth:2.0:oob", "http://localhost"],
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }
+    }
+    flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
+    creds = flow.run_local_server(port=0)
+    _save_creds(creds)
+    print(f"Credentials saved to {GDRIVE_CREDS_FILE}")
+
+
+# ── Drive helpers ─────────────────────────────────────────────────────────────
+
+def _list_folder(service, folder_id: str) -> list[dict]:
+    items, page_token = [], None
+    while True:
+        resp = service.files().list(
+            q=f"'{folder_id}' in parents and trashed = false",
+            fields="nextPageToken, files(id, name, mimeType)",
+            pageToken=page_token,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        items.extend(resp.get("files", []))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return items
+
+
+def _get_or_create_folder(service, parent_id: str, name: str) -> str:
+    items = _list_folder(service, parent_id)
+    for item in items:
+        if item["name"] == name and item["mimeType"] == "application/vnd.google-apps.folder":
+            return item["id"]
+    meta = {"name": name, "mimeType": "application/vnd.google-apps.folder",
+            "parents": [parent_id]}
+    folder = service.files().create(
+        body=meta, fields="id",
+        supportsAllDrives=True,
+    ).execute()
+    return folder["id"]
+
+
+def _existing_zip_names(service, folder_id: str) -> set[str]:
+    """All zip filenames already present anywhere under folder_id."""
+    names = set()
+    for item in _list_folder(service, folder_id):
+        if item["mimeType"] == "application/vnd.google-apps.folder":
+            for child in _list_folder(service, item["id"]):
+                if child["name"].endswith(".zip"):
+                    names.add(child["name"])
+        elif item["name"].endswith(".zip"):
+            names.add(item["name"])
+    return names
+
+
+def _upload_zip(service, parent_folder_id: str, name: str, data: bytes):
+    from googleapiclient.http import MediaIoBaseUpload
+    media = MediaIoBaseUpload(io.BytesIO(data), mimetype="application/zip",
+                              resumable=True, chunksize=8 * 1024 * 1024)
+    meta = {"name": name, "parents": [parent_folder_id]}
+    request = service.files().create(
+        body=meta, media_body=media, fields="id",
+        supportsAllDrives=True,
+    )
+    response = None
+    while response is None:
+        status, response = request.next_chunk()
+        if status:
+            pct = int(status.progress() * 100)
+            print(f"\r  {pct}%", end="", flush=True)
+    print()
+    return response["id"]
+
+
+# ── GitLab wiki ───────────────────────────────────────────────────────────────
+
+def _read_gitlab_token() -> str:
+    tok = os.environ.get("GITLAB_WIKI_TOKEN", "").strip()
+    if tok:
+        return tok
+    if GITLAB_TOKEN_FILE.exists():
+        tok = GITLAB_TOKEN_FILE.read_text().strip()
+        if tok:
+            return tok
+    raise RuntimeError(
+        f"No GitLab token. Set $GITLAB_WIKI_TOKEN or write it to {GITLAB_TOKEN_FILE}"
+    )
+
+
+def _git(args: list[str], cwd: Path, check: bool = True):
     return subprocess.run(
         ["git"] + args, cwd=cwd,
         env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
@@ -77,29 +203,20 @@ def ensure_wiki(token: str) -> Path:
     return WIKI_DIR
 
 
-
-# ── parsing ───────────────────────────────────────────────────────────────────
-
-def parse_latest_darwin(md_text: str) -> list[tuple[str, str, str]]:
-    """Return (version, zip_filename, git_path) from the Latest Package section.
-
-    Skips strikethrough links (~~[...]~~).
-    """
+def parse_latest_zips(md_text: str) -> list[tuple[str, str, str]]:
+    """Return (version, zip_filename, git_path) for all non-struck-through zips
+    in the Latest Package section."""
     m = re.search(r'^#+\s*Latest Package', md_text, re.MULTILINE | re.IGNORECASE)
     if not m:
         return []
-
     section = md_text[m.start():]
-    # Stop at the next horizontal rule or same-level heading that starts a new
-    # section (e.g. "# Older Packages" or "---")
     cut = re.search(r'\n(---+|#{1,2}\s+Older)', section[1:])
     if cut:
         section = section[: cut.start() + 1]
 
     results = []
-    # Match only non-strikethrough Darwin-Release zip links
     for lm in re.finditer(
-        r'(?<!~)\[([^\]]*Darwin-Release[^\]]*\.zip)\]\((uploads/[^)]+\.zip)\)(?!~)',
+        r'(?<!~)\[([^\]]+\.zip)\]\((uploads/[^)]+\.zip)\)(?!~)',
         section,
     ):
         zip_name = lm.group(1)
@@ -107,86 +224,78 @@ def parse_latest_darwin(md_text: str) -> list[tuple[str, str, str]]:
         ver_m = re.search(r'SkpXyz-(\d+\.\d+(?:\.\d+)*)-', zip_name)
         version = ver_m.group(1) if ver_m else "unknown"
         results.append((version, zip_name, git_path))
-
     return results
 
 
-# ── deliverables ──────────────────────────────────────────────────────────────
-
-def existing_darwin_zips(deliverables_dir: Path) -> set[str]:
-    if not deliverables_dir.exists():
-        return set()
-    return {p.name for p in deliverables_dir.rglob("*Darwin*.zip")}
-
-
-def copy_to_deliverables(
-    wiki_dir: Path, git_path: str, zip_name: str,
-    version: str, deliverables_dir: Path,
-) -> Path:
-    dest_dir = deliverables_dir / f"Exporter & Importer {version}"
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / zip_name
-    tmp = dest.with_suffix(".zip.tmp")
-    print(f"[sync] downloading {zip_name} ({version})...")
-    # git show fetches the blob on demand from the partial clone (no sparse-checkout
-    # cone restriction) and streams it; write directly to avoid a double-copy.
+def fetch_zip_bytes(wiki_dir: Path, git_path: str) -> bytes:
     r = subprocess.run(
         ["git", "show", f"HEAD:{git_path}"],
         cwd=wiki_dir,
         env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
         capture_output=True, check=True,
     )
-    tmp.write_bytes(r.stdout)
-    tmp.replace(dest)
-    print(f"[sync] saved {dest.stat().st_size // 1024 // 1024} MB -> {dest_dir.name}/{zip_name}")
-    return dest
+    return r.stdout
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
-def sync() -> list[Path]:
-    token = read_token()
+def sync():
+    gitlab_token = _read_gitlab_token()
+    service = _gdrive_service()
 
-    if not DELIVERABLES_DIR.exists():
-        print(f"[sync] skipped: Deliverables folder not found at {DELIVERABLES_DIR}")
-        return []
-
-    wiki_dir = ensure_wiki(token)
+    wiki_dir = ensure_wiki(gitlab_token)
     md_path = wiki_dir / "Installation.md"
     if not md_path.exists():
         print("[sync] Installation.md not found")
-        return []
+        return
 
-    entries = parse_latest_darwin(md_path.read_text())
+    entries = parse_latest_zips(md_path.read_text())
     if not entries:
-        print("[sync] no Darwin-Release zips found in Latest Package section")
-        return []
+        print("[sync] no zips found in Latest Package section")
+        return
 
-    existing = existing_darwin_zips(DELIVERABLES_DIR)
-    copied: list[Path] = []
+    existing = _existing_zip_names(service, DELIVERABLES_FOLDER_ID)
+    version_folder_cache: dict[str, str] = {}
+    copied = 0
 
     for version, zip_name, git_path in entries:
         if zip_name in existing:
             print(f"[sync] already have {zip_name}")
             continue
-        print(f"[sync] new release: {version}  ({zip_name})")
-        try:
-            dest = copy_to_deliverables(wiki_dir, git_path, zip_name, version,
-                                        DELIVERABLES_DIR)
-            copied.append(dest)
-        except Exception as e:
-            print(f"[sync] failed: {e}", file=sys.stderr)
+        print(f"[sync] new: {zip_name}")
+        if version not in version_folder_cache:
+            label = f"Exporter & Importer {version}"
+            fid = _get_or_create_folder(service, DELIVERABLES_FOLDER_ID, label)
+            version_folder_cache[version] = fid
+            print(f"[sync] folder: {label}")
+        folder_id = version_folder_cache[version]
+        print(f"[sync] downloading from wiki...")
+        data = fetch_zip_bytes(wiki_dir, git_path)
+        mb = len(data) / 1024 / 1024
+        print(f"[sync] uploading {zip_name} ({mb:.0f} MB) to Drive...")
+        _upload_zip(service, folder_id, zip_name, data)
+        print(f"[sync] done: {zip_name}")
+        copied += 1
 
-    if not copied:
-        print("[sync] up to date.")
-    else:
-        print(f"[sync] synced {len(copied)} new release(s).")
-    return copied
+    print(f"[sync] synced {copied} new file(s)." if copied else "[sync] up to date.")
 
 
-if __name__ == "__main__":
+def main():
+    ap = argparse.ArgumentParser(description="Sync SkpXyz releases from wiki to Drive.")
+    ap.add_argument("--auth", action="store_true",
+                    help="Run OAuth flow to store Drive credentials.")
+    args = ap.parse_args()
+
+    if args.auth:
+        do_auth()
+        return
+
     try:
         sync()
     except RuntimeError as e:
         print(f"[sync] {e}", file=sys.stderr)
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
