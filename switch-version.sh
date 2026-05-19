@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOCAL_BUILDS_DIR="$SCRIPT_DIR/builds"
-DRIVE_BUILDS_DIR="/Users/tkluysk/Library/CloudStorage/GoogleDrive-tom_kluyskens@trimble.com/Shared drives/CDG Projects & Clients/JCube/OEM • USD IO/Deliverables"
+DRIVE_BUILDS_DIR="/Users/tkluysk/Library/CloudStorage/GoogleDrive-tom_kluyskens@trimble.com/My Drive/Projects & Clients/JCube/Deliverables"
 DRIVE_CACHE_DIR="$SCRIPT_DIR/.drive-cache"
 
 BUILDS_DIR=""
