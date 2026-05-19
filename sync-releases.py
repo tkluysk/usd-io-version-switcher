@@ -3,11 +3,11 @@
 to the local Google Drive Deliverables folder.
 
 Token (needs read_api + read_repository scope):
-  File:    ~/.config/bench/gitlab-token  (one line)
+  File:    ~/.config/usd-switcher/gitlab-token  (one line)
   Env var: GITLAB_WIKI_TOKEN
 
-Wiki is sparse-cloned at ~/.bench/wiki/ — only Installation.md is fetched
-initially; zip blobs are pulled on demand.
+Wiki is sparse-cloned at ~/.cache/usd-switcher/wiki/ — only Installation.md
+is fetched initially; zip blobs are pulled on demand.
 """
 from __future__ import annotations
 
@@ -18,8 +18,8 @@ import sys
 from pathlib import Path
 
 WIKI_URL = "https://oauth2:{token}@gitlab.com/jcube/t-support.wiki.git"
-WIKI_DIR = Path.home() / ".bench" / "wiki"
-TOKEN_FILE = Path.home() / ".config" / "bench" / "gitlab-token"
+WIKI_DIR = Path.home() / ".cache" / "usd-switcher" / "wiki"
+TOKEN_FILE = Path.home() / ".config" / "usd-switcher" / "gitlab-token"
 
 DELIVERABLES_DIR = (
     Path.home()
