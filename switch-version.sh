@@ -13,15 +13,20 @@ SKETCHUP_APPS=()
 SKETCHUP_TARGETS=()
 
 discover_sketchup_apps() {
+    # Use if/then (not `[[ ]] && cmd`) — under bash 3.2 + `set -e`, a failing
+    # `&&` compound at the top of a function aborts the script.
+    local dir app
     # Nested layout (2026+): /Applications/SketchUp <year>/SketchUp.app
-    local dir
     for dir in /Applications/SketchUp\ */; do
-        [[ -d "${dir}SketchUp.app/Contents" ]] && SKETCHUP_APPS+=("${dir%/}/SketchUp.app")
+        if [[ -d "${dir}SketchUp.app/Contents" ]]; then
+            SKETCHUP_APPS+=("${dir%/}/SketchUp.app")
+        fi
     done
     # Flat layout (older releases / dev builds): /Applications/SketchUp <ver>.app
-    local app
     for app in /Applications/SketchUp\ *.app; do
-        [[ -d "$app/Contents" ]] && SKETCHUP_APPS+=("$app")
+        if [[ -d "$app/Contents" ]]; then
+            SKETCHUP_APPS+=("$app")
+        fi
     done
 }
 
