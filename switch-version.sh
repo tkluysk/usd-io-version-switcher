@@ -9,12 +9,21 @@ DRIVE_CACHE_DIR="$SCRIPT_DIR/.drive-cache"
 BUILDS_DIR=""
 SOURCE_MODE=""  # "local" or "drive"
 
-SKETCHUP_APPS=(
-    '/Applications/SketchUp 2026/SketchUp 26.2.app'
-    '/Applications/SketchUp 26.0.app'
-    '/Applications/SketchUp 96.8.app'
-)
+SKETCHUP_APPS=()
 SKETCHUP_TARGETS=()
+
+discover_sketchup_apps() {
+    # Nested layout (2026+): /Applications/SketchUp <year>/SketchUp.app
+    local dir
+    for dir in /Applications/SketchUp\ */; do
+        [[ -d "${dir}SketchUp.app/Contents" ]] && SKETCHUP_APPS+=("${dir%/}/SketchUp.app")
+    done
+    # Flat layout (older releases / dev builds): /Applications/SketchUp <ver>.app
+    local app
+    for app in /Applications/SketchUp\ *.app; do
+        [[ -d "$app/Contents" ]] && SKETCHUP_APPS+=("$app")
+    done
+}
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -27,10 +36,8 @@ FRAMEWORKS_DIR=""
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 pick_sketchup() {
-    local available=()
-    for app in "${SKETCHUP_APPS[@]}"; do
-        [[ -d "$app/Contents" ]] && available+=("$app")
-    done
+    discover_sketchup_apps
+    local available=("${SKETCHUP_APPS[@]}")
 
     [[ ${#available[@]} -eq 0 ]] && die "No SketchUp installation found."
 
