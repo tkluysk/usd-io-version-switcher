@@ -3,17 +3,18 @@ $ErrorActionPreference = 'Stop'
 
 $ScriptDir      = Split-Path -Parent $MyInvocation.MyCommand.Path
 $LocalBuildsDir = Join-Path $ScriptDir 'builds'
-$DriveBuildsDir = 'H:\My Drive\Projects & Clients\JCube\Deliverables'
+$DriveRelPath   = 'My Drive\Projects & Clients\JCube\Deliverables'
 $DriveCacheDir  = Join-Path $ScriptDir '.drive-cache'
 $SketchUpRoot   = 'C:\Program Files\SketchUp'
 
-$script:BuildsDir     = ''
-$script:SourceMode    = ''   # 'local' or 'drive'
+$script:BuildsDir       = ''
+$script:DriveBuildsDir  = ''
+$script:SourceMode      = ''   # 'local' or 'drive'
 $script:SketchUpTargets = @()
-$script:Versions      = @()
-$script:VersionRoots  = @()
-$script:ExportersDir  = ''
-$script:ImportersDir  = ''
+$script:Versions        = @()
+$script:VersionRoots    = @()
+$script:ExportersDir    = ''
+$script:ImportersDir    = ''
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -25,28 +26,54 @@ function Die([string]$msg) {
     exit 1
 }
 
+function Find-DriveBuildsDir {
+    foreach ($drive in [System.IO.DriveInfo]::GetDrives()) {
+        if (-not $drive.IsReady) { continue }
+        $candidate = Join-Path $drive.RootDirectory.FullName $DriveRelPath
+        if (Test-Path $candidate -PathType Container) { return $candidate }
+    }
+    return $null
+}
+
+# SketchUp 2024 has Exporters/Importers directly under the version dir;
+# 2026+ nests them under a SketchUp\ subfolder. Returns @(exporters, importers) or $null.
+function Get-ExporterImporterDirs([string]$sketchupDir) {
+    $nestedExp = Join-Path $sketchupDir 'SketchUp\Exporters'
+    $nestedImp = Join-Path $sketchupDir 'SketchUp\Importers'
+    if ((Test-Path $nestedExp -PathType Container) -and (Test-Path $nestedImp -PathType Container)) {
+        return @($nestedExp, $nestedImp)
+    }
+    $flatExp = Join-Path $sketchupDir 'Exporters'
+    $flatImp = Join-Path $sketchupDir 'Importers'
+    if ((Test-Path $flatExp -PathType Container) -and (Test-Path $flatImp -PathType Container)) {
+        return @($flatExp, $flatImp)
+    }
+    return $null
+}
+
 function Select-Source {
     $localOk = Test-Path $LocalBuildsDir -PathType Container
-    $driveOk = Test-Path $DriveBuildsDir -PathType Container
+    $script:DriveBuildsDir = Find-DriveBuildsDir
+    $driveOk = [bool]$script:DriveBuildsDir
 
     if ($localOk -and -not $driveOk) {
         $script:SourceMode = 'local'; $script:BuildsDir = $LocalBuildsDir; return
     }
     if ($driveOk -and -not $localOk) {
-        $script:SourceMode = 'drive'; $script:BuildsDir = $DriveBuildsDir; return
+        $script:SourceMode = 'drive'; $script:BuildsDir = $script:DriveBuildsDir; return
     }
     if (-not $localOk -and -not $driveOk) {
-        Die "Neither local builds dir ($LocalBuildsDir) nor Drive dir ($DriveBuildsDir) found."
+        Die "Neither local builds dir ($LocalBuildsDir) nor a Google Drive mount with '$DriveRelPath' was found."
     }
 
     Write-Host "Select source:"
     Write-Host "  1) Local builds folder ($LocalBuildsDir)"
-    Write-Host "  2) Google Drive (H:\My Drive\...JCube\Deliverables)"
+    Write-Host "  2) Google Drive ($script:DriveBuildsDir)"
     Write-Host ""
     $choice = Read-Host "Select source [1-2]"
     switch ($choice) {
         '1' { $script:SourceMode = 'local'; $script:BuildsDir = $LocalBuildsDir }
-        '2' { $script:SourceMode = 'drive'; $script:BuildsDir = $DriveBuildsDir }
+        '2' { $script:SourceMode = 'drive'; $script:BuildsDir = $script:DriveBuildsDir }
         default { Die "Invalid selection: $choice" }
     }
 }
@@ -55,7 +82,7 @@ function Select-SketchUp {
     $available = @()
     $dirs = Get-ChildItem $SketchUpRoot -Directory -ErrorAction SilentlyContinue
     foreach ($d in $dirs) {
-        if (Test-Path (Join-Path $d.FullName 'SketchUp\Exporters') -PathType Container) {
+        if (Get-ExporterImporterDirs $d.FullName) {
             $available += $d.FullName
         }
     }
@@ -259,8 +286,10 @@ if ($choice -notmatch '^\d+$' -or [int]$choice -lt 1 -or [int]$choice -gt $scrip
 $idx = [int]$choice - 1
 
 foreach ($sketchupDir in $script:SketchUpTargets) {
-    $script:ExportersDir = Join-Path $sketchupDir 'SketchUp\Exporters'
-    $script:ImportersDir = Join-Path $sketchupDir 'SketchUp\Importers'
+    $dirs = Get-ExporterImporterDirs $sketchupDir
+    if (-not $dirs) { Die "Exporters/Importers folders not found under $sketchupDir" }
+    $script:ExportersDir = $dirs[0]
+    $script:ImportersDir = $dirs[1]
 
     Write-Host ""
     Write-Host ">>> $(Split-Path -Leaf $sketchupDir)"
