@@ -3,7 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOCAL_BUILDS_DIR="$SCRIPT_DIR/builds"
-DRIVE_BUILDS_DIR="/Users/tkluysk/Library/CloudStorage/GoogleDrive-tom_kluyskens@trimble.com/My Drive/Projects & Clients/JCube/Deliverables"
+DRIVE_REL_PATH="My Drive/Projects & Clients/JCube/Deliverables"
+DRIVE_BUILDS_DIR=""  # discovered at runtime by find_drive_builds_dir
 DRIVE_CACHE_DIR="$SCRIPT_DIR/.drive-cache"
 
 BUILDS_DIR=""
@@ -40,6 +41,32 @@ FRAMEWORKS_DIR=""
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
+# Optionally pull new SkpXyz releases from the GitLab wiki into Drive so the
+# version list below is up to date. Never aborts the switcher on failure.
+maybe_sync() {
+    local sync_script="$SCRIPT_DIR/sync-releases.py"
+    [[ -f "$sync_script" ]] || return 0
+
+    local ans
+    read -rp "Check GitLab for new versions and sync to Drive? [y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || return 0
+
+    local py=""
+    if command -v python3 >/dev/null 2>&1; then
+        py=python3
+    elif command -v python >/dev/null 2>&1; then
+        py=python
+    else
+        echo "  python not found — skipping version check." >&2
+        return 0
+    fi
+
+    echo "Checking GitLab for new releases..."
+    if ! "$py" "$sync_script"; then
+        echo "  (version check failed — continuing with versions already in Drive)" >&2
+    fi
+}
+
 pick_sketchup() {
     discover_sketchup_apps
     local available=("${SKETCHUP_APPS[@]}")
@@ -69,10 +96,25 @@ pick_sketchup() {
     fi
 }
 
+# Scan Google Drive for Desktop mounts for the Deliverables folder, so the
+# switcher isn't pinned to one user's CloudStorage path. Echoes the path on
+# success. (if/then form to avoid the bash 3.2 + `set -e` && abort.)
+find_drive_builds_dir() {
+    local base
+    for base in "$HOME/Library/CloudStorage"/GoogleDrive-*; do
+        if [[ -d "$base/$DRIVE_REL_PATH" ]]; then
+            echo "$base/$DRIVE_REL_PATH"
+            return 0
+        fi
+    done
+    return 1
+}
+
 pick_source() {
     local local_ok=0 drive_ok=0
     [[ -d "$LOCAL_BUILDS_DIR" ]] && local_ok=1
-    [[ -d "$DRIVE_BUILDS_DIR" ]] && drive_ok=1
+    DRIVE_BUILDS_DIR="$(find_drive_builds_dir || true)"
+    [[ -n "$DRIVE_BUILDS_DIR" ]] && drive_ok=1
 
     # Resolve symlinks so find works correctly
     (( local_ok )) && LOCAL_BUILDS_DIR="$(cd "$LOCAL_BUILDS_DIR" && pwd -P)"
@@ -87,7 +129,7 @@ pick_source() {
 
     echo "Select source:"
     echo "  1) Local builds folder ($LOCAL_BUILDS_DIR)"
-    echo "  2) Google Drive (OEM • USD IO/Deliverables)"
+    echo "  2) Google Drive ($DRIVE_BUILDS_DIR)"
     echo ""
     read -rp "Select source [1-2]: " choice
     case "$choice" in
@@ -255,19 +297,6 @@ log_cp() {
     fi
 }
 
-install_035() {
-    local root="$1"
-    echo "Installing v0.3.5 (Exporter only)..."
-
-    log_cp -R "$root/lib/PlugIns/UsdExporter.plugin" "$PLUGINS_DIR/"
-
-    log_cp "" "$root/lib/libSkpIO.dylib"            "$FRAMEWORKS_DIR/"
-    log_cp "" "$root/lib/libskp_usd_ms.dylib"       "$FRAMEWORKS_DIR/"
-    log_cp "" "$root/lib/libtbb12-202190.dylib"     "$FRAMEWORKS_DIR/"
-    log_cp "" "$root/lib/libtbbmalloc-202190.dylib" "$FRAMEWORKS_DIR/"
-    log_cp -R "$root/lib/skp_usd"                   "$FRAMEWORKS_DIR/"
-}
-
 install_04x() {
     local root="$1"
     echo "Installing v0.4.x+ (Exporter & Importer)..."
@@ -292,12 +321,7 @@ install_version() {
     local root="$2"
 
     remove_installed
-
-    if [[ "$label" == *"0.3.5"* ]]; then
-        install_035 "$root"
-    else
-        install_04x "$root"
-    fi
+    install_04x "$root"
 
     echo "$label" > "$PLUGINS_DIR/.usd_version"
 
@@ -310,6 +334,9 @@ install_version() {
 echo ""
 echo "USD IO Version Switcher"
 echo "========================"
+echo ""
+
+maybe_sync
 echo ""
 
 pick_source

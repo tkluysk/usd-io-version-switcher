@@ -51,6 +51,31 @@ function Get-ExporterImporterDirs([string]$sketchupDir) {
     return $null
 }
 
+# Optionally pull new SkpXyz releases from the GitLab wiki into Drive so the
+# version list below is up to date. Never aborts the switcher on failure.
+function Invoke-MaybeSync {
+    $syncScript = Join-Path $ScriptDir 'sync-releases.py'
+    if (-not (Test-Path $syncScript)) { return }
+
+    $ans = Read-Host "Check GitLab for new versions and sync to Drive? [y/N]"
+    if ($ans -notmatch '^[Yy]$') { return }
+
+    $py = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $py) { $py = Get-Command python3 -ErrorAction SilentlyContinue }
+    if (-not $py) {
+        Write-Host "  python not found - skipping version check." -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host "Checking GitLab for new releases..."
+    try {
+        & $py.Source $syncScript
+        if ($LASTEXITCODE -ne 0) { throw "exit $LASTEXITCODE" }
+    } catch {
+        Write-Host "  (version check failed - continuing with versions already in Drive)" -ForegroundColor Yellow
+    }
+}
+
 function Select-Source {
     $localOk = Test-Path $LocalBuildsDir -PathType Container
     $script:DriveBuildsDir = Find-DriveBuildsDir
@@ -264,6 +289,9 @@ function Install-Version([string]$label, [string]$root) {
 Write-Host ""
 Write-Host "USD IO Version Switcher"
 Write-Host "========================"
+Write-Host ""
+
+Invoke-MaybeSync
 Write-Host ""
 
 Select-Source
