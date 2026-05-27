@@ -60,13 +60,30 @@ Pulls new `SkpXyz-*-win64-Release.zip` / `*-Darwin*.zip` from the
 `jcube/t-support` GitLab wiki and uploads any that aren't already in the
 Drive `Deliverables` folder (creating per-version subfolders).
 
+The switcher can run this for you: answer `y` at the **"Check GitLab for
+new versions"** prompt on startup, and it syncs to Drive before listing
+versions. The setup below is required for that to work.
+
 ### One-time setup
 
-1. **Install Python 3.12+** and the Google client libs:
+1. **Install Python 3.12+** and the Google client libs into a repo-local
+   virtualenv (keeps them out of the system/Homebrew Python, which avoids
+   PEP 668 "externally managed" errors and cross-project clobbering). The
+   switcher auto-detects `.venv/` and prefers it over the system Python.
+
+   macOS:
+
+   ```bash
+   python3 -m venv .venv
+   ./.venv/bin/python -m pip install google-api-python-client google-auth google-auth-oauthlib
+   ```
+
+   Windows:
 
    ```powershell
    winget install --id Python.Python.3.12 --scope user
-   python -m pip install --user google-api-python-client google-auth google-auth-oauthlib
+   python -m venv .venv
+   .\.venv\Scripts\python -m pip install google-api-python-client google-auth google-auth-oauthlib
    ```
 
 2. **Google OAuth client secret.** The OAuth client is hosted on the
@@ -84,7 +101,7 @@ Drive `Deliverables` folder (creating per-version subfolders).
    `-EncodedCommand` — Trimble's Bitdefender will silently kill that):
 
    ```powershell
-   python sync-releases.py --auth --client-secret <path-to-client_secret_*.json>
+   .\.venv\Scripts\python sync-releases.py --auth --client-secret <path-to-client_secret_*.json>
    ```
 
    A browser opens; sign in as `tom_kluyskens@trimble.com`. After
@@ -100,8 +117,12 @@ Drive `Deliverables` folder (creating per-version subfolders).
 
 ### Daily use
 
-```powershell
-python sync-releases.py
+Easiest is to answer `y` at the switcher's startup prompt. To run it
+directly:
+
+```bash
+./.venv/bin/python sync-releases.py          # macOS
+.\.venv\Scripts\python sync-releases.py      # Windows
 ```
 
 Sparse-clones (or fast-forwards) the wiki to `~/.cache/usd-switcher/wiki/`,

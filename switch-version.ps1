@@ -60,16 +60,22 @@ function Invoke-MaybeSync {
     $ans = Read-Host "Check GitLab for new versions and sync to Drive? [y/N]"
     if ($ans -notmatch '^[Yy]$') { return }
 
-    $py = Get-Command python -ErrorAction SilentlyContinue
-    if (-not $py) { $py = Get-Command python3 -ErrorAction SilentlyContinue }
-    if (-not $py) {
-        Write-Host "  python not found - skipping version check." -ForegroundColor Yellow
-        return
+    $venvPy = Join-Path $ScriptDir '.venv\Scripts\python.exe'
+    if (Test-Path $venvPy) {
+        $pyPath = $venvPy
+    } else {
+        $py = Get-Command python -ErrorAction SilentlyContinue
+        if (-not $py) { $py = Get-Command python3 -ErrorAction SilentlyContinue }
+        if (-not $py) {
+            Write-Host "  python not found - skipping version check." -ForegroundColor Yellow
+            return
+        }
+        $pyPath = $py.Source
     }
 
     Write-Host "Checking GitLab for new releases..."
     try {
-        & $py.Source $syncScript
+        & $pyPath $syncScript
         if ($LASTEXITCODE -ne 0) { throw "exit $LASTEXITCODE" }
     } catch {
         Write-Host "  (version check failed - continuing with versions already in Drive)" -ForegroundColor Yellow

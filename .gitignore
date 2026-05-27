@@ -1,3 +1,4 @@
 builds
 .DS_Store
 .drive-cache/
+.venv/

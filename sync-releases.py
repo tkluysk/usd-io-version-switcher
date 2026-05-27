@@ -286,6 +286,14 @@ def main():
 
     try:
         sync()
+    except ImportError:
+        print(
+            "[sync] Google client libraries not installed. Install with:\n"
+            "  python3 -m pip install --user google-api-python-client "
+            "google-auth google-auth-oauthlib",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     except RuntimeError as e:
         print(f"[sync] {e}", file=sys.stderr)
         sys.exit(1)
