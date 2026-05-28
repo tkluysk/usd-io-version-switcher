@@ -47,7 +47,10 @@ def _gdrive_service():
     from googleapiclient.discovery import build
 
     if GDRIVE_CREDS_FILE.exists():
-        creds = Credentials.from_authorized_user_file(str(GDRIVE_CREDS_FILE), SCOPES)
+        # Load whatever scopes the file already has rather than forcing SCOPES,
+        # so a token broadened by another tool (e.g. a sibling repo that also
+        # needs Sheets) doesn't get narrowed back to Drive-only on refresh.
+        creds = Credentials.from_authorized_user_file(str(GDRIVE_CREDS_FILE))
         if not creds.valid:
             if creds.expired and creds.refresh_token:
                 from google.auth.transport.requests import Request
