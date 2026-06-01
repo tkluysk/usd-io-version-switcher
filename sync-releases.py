@@ -31,6 +31,12 @@ WIKI_DIR       = Path.home() / ".cache" / "usd-switcher" / "wiki"
 GITLAB_TOKEN_FILE = Path.home() / ".config" / "usd-switcher" / "gitlab-token"
 GDRIVE_CREDS_FILE = Path.home() / ".config" / "usd-switcher" / "gdrive-credentials.json"
 
+# Repo-local staging dir for just-uploaded Release zips, so the switcher
+# can use a new version immediately instead of waiting for Drive for Desktop
+# to surface it in the local CloudStorage mount.
+SCRIPT_DIR    = Path(__file__).resolve().parent
+INCOMING_DIR  = SCRIPT_DIR / ".drive-cache" / "incoming"
+
 # Drive folder ID for the Deliverables folder
 DELIVERABLES_FOLDER_ID = "1uh930UJISCCTwvV1Xk2Fdgo7Y_I-D8zH"
 
@@ -232,6 +238,18 @@ def fetch_zip_bytes(wiki_dir: Path, git_path: str) -> bytes:
     return r.stdout
 
 
+def _stage_locally(version_folder: str, zip_name: str, data: bytes) -> None:
+    """Mirror a just-uploaded zip into <repo>/.drive-cache/incoming/ so the
+    switcher can install it immediately, without waiting for Drive for
+    Desktop to surface the new file in the local CloudStorage mount."""
+    dest_dir = INCOMING_DIR / version_folder
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / zip_name
+    dest.write_bytes(data)
+    rel = dest.relative_to(SCRIPT_DIR)
+    print(f"[sync] staged: {rel}")
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def sync():
@@ -258,8 +276,8 @@ def sync():
             print(f"[sync] already have {zip_name}")
             continue
         print(f"[sync] new: {zip_name}")
+        label = f"Exporter & Importer {version}"
         if version not in version_folder_cache:
-            label = f"Exporter & Importer {version}"
             fid = _get_or_create_folder(service, DELIVERABLES_FOLDER_ID, label)
             version_folder_cache[version] = fid
             print(f"[sync] folder: {label}")
@@ -270,6 +288,11 @@ def sync():
         print(f"[sync] uploading {zip_name} ({mb:.0f} MB) to Drive...")
         _upload_zip(service, folder_id, zip_name, data)
         print(f"[sync] done: {zip_name}")
+        # Stage Release builds locally so the switcher can use them before
+        # Drive for Desktop surfaces them on the local CloudStorage mount.
+        # Debug builds aren't installed by the switcher, so skip them.
+        if "Release" in zip_name:
+            _stage_locally(label, zip_name, data)
         copied += 1
 
     print(f"[sync] synced {copied} new file(s)." if copied else "[sync] up to date.")

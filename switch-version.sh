@@ -6,6 +6,10 @@ LOCAL_BUILDS_DIR="$SCRIPT_DIR/builds"
 DRIVE_REL_PATH="My Drive/Projects & Clients/JCube/Deliverables"
 DRIVE_BUILDS_DIR=""  # discovered at runtime by find_drive_builds_dir
 DRIVE_CACHE_DIR="$SCRIPT_DIR/.drive-cache"
+# Newly-synced Release zips that Drive for Desktop may not have surfaced on
+# the local mount yet — staged by sync-releases.py so the switcher can use
+# them immediately. Treated as additional drive-mode entries below.
+INCOMING_DIR="$DRIVE_CACHE_DIR/incoming"
 
 BUILDS_DIR=""
 SOURCE_MODE=""  # "local" or "drive"
@@ -157,8 +161,13 @@ resolve_darwin_root() {
         [[ -z "$zip" ]] && return 1
 
         local label cache
-        # Use the dir path relative to the drive root as a stable cache key
-        label="${dir#$DRIVE_BUILDS_DIR/}"
+        # Use the dir path relative to its source root as a stable cache key.
+        # Staged dirs live under $INCOMING_DIR; Drive-mount dirs under $DRIVE_BUILDS_DIR.
+        if [[ "$dir" == "$INCOMING_DIR"/* ]]; then
+            label="${dir#$INCOMING_DIR/}"
+        else
+            label="${dir#$DRIVE_BUILDS_DIR/}"
+        fi
         cache="$DRIVE_CACHE_DIR/${label//\//__}"
         darwin_root=$(find "$cache" -maxdepth 1 -type d -name "*Darwin*" 2>/dev/null | head -1)
         if [[ -z "$darwin_root" ]]; then
@@ -184,9 +193,29 @@ list_drive_entry() {
 
 list_versions() {
     local idx=1 added
+    # Plain string of "|label|" tokens; bash 3.2 has no associative arrays.
+    local seen=""
+
+    # Pre-pass: list staged versions (newly-synced zips that Drive for Desktop
+    # may not have surfaced on the local mount yet). Drive mode only.
+    if [[ "$SOURCE_MODE" == "drive" && -d "$INCOMING_DIR" ]]; then
+        while IFS= read -r -d '' dir; do
+            local label
+            label=$(basename "$dir")
+            if list_drive_entry "$dir" "$label"; then
+                echo "  $idx) $label"
+                seen="$seen|$label|"
+                ((idx++))
+            fi
+        done < <(find "$INCOMING_DIR" -maxdepth 1 -mindepth 1 -type d | sort -Vr | tr '\n' '\0')
+    fi
+
     while IFS= read -r -d '' dir; do
         local label
         label=$(basename "$dir")
+        # Already added from the staging pre-pass — don't list again.
+        case "$seen" in *"|$label|"*) continue ;; esac
+
         if [[ "$SOURCE_MODE" == "drive" ]]; then
             # Skip anything older than 0.4.0
             if [[ "$label" =~ [[:space:]]0\.([0-3])\. ]] || [[ "$label" =~ [[:space:]]0\.[0-3]$ ]]; then

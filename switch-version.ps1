@@ -5,6 +5,10 @@ $ScriptDir      = Split-Path -Parent $MyInvocation.MyCommand.Path
 $LocalBuildsDir = Join-Path $ScriptDir 'builds'
 $DriveRelPath   = 'My Drive\Projects & Clients\JCube\Deliverables'
 $DriveCacheDir  = Join-Path $ScriptDir '.drive-cache'
+# Newly-synced Release zips that Drive for Desktop may not have surfaced on
+# the local mount yet — staged by sync-releases.py so the switcher can use
+# them immediately. Treated as additional drive-mode entries below.
+$IncomingDir    = Join-Path $DriveCacheDir 'incoming'
 $SketchUpRoot   = 'C:\Program Files\SketchUp'
 
 $script:BuildsDir       = ''
@@ -152,7 +156,13 @@ function Resolve-WindowsRoot([string]$dir) {
                Select-Object -First 1
         if (-not $zip) { return $null }
 
-        $label = $dir.Substring($script:BuildsDir.Length).TrimStart('\')
+        # Use the dir path relative to its source root as a stable cache key.
+        # Staged dirs live under $IncomingDir; Drive-mount dirs under $script:BuildsDir.
+        if ($dir.StartsWith($IncomingDir, [StringComparison]::OrdinalIgnoreCase)) {
+            $label = $dir.Substring($IncomingDir.Length).TrimStart('\')
+        } else {
+            $label = $dir.Substring($script:BuildsDir.Length).TrimStart('\')
+        }
         $cache = Join-Path $DriveCacheDir ($label -replace '\\', '__')
         $winDir = Get-ChildItem $cache -Directory -Filter '*win64-Release*' -ErrorAction SilentlyContinue |
                   Select-Object -First 1
@@ -176,11 +186,32 @@ function Test-HasWindowsBuild([string]$dir) {
 
 function Get-Versions {
     $idx  = 1
+    $seen = @{}
+
+    # Pre-pass: list staged versions (newly-synced zips that Drive for Desktop
+    # may not have surfaced on the local mount yet). Drive mode only.
+    if ($script:SourceMode -eq 'drive' -and (Test-Path $IncomingDir)) {
+        $stagedDirs = Get-ChildItem $IncomingDir -Directory |
+                      Sort-Object { [version]($_.Name -replace '^.*?(\d+\.\d+(\.\d+)*).*$','$1') } -Descending -ErrorAction SilentlyContinue
+        foreach ($dir in $stagedDirs) {
+            $label = $dir.Name
+            if (Test-HasWindowsBuild $dir.FullName) {
+                $script:Versions     += $label
+                $script:VersionRoots += $dir.FullName
+                Write-Host "  $idx) $label"
+                $seen[$label] = $true
+                $idx++
+            }
+        }
+    }
+
     $dirs = Get-ChildItem $script:BuildsDir -Directory |
             Sort-Object { [version]($_.Name -replace '^.*?(\d+\.\d+(\.\d+)*).*$','$1') } -Descending -ErrorAction SilentlyContinue
 
     foreach ($dir in $dirs) {
         $label = $dir.Name
+        # Already added from the staging pre-pass — don't list again.
+        if ($seen.ContainsKey($label)) { continue }
         # Skip pre-0.4.0
         if ($label -match '\s0\.[0-3]\.' -or $label -match '\s0\.[0-3]$') { continue }
 
