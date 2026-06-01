@@ -272,11 +272,18 @@ def sync():
     copied = 0
 
     for version, zip_name, git_path in entries:
+        label = f"Exporter & Importer {version}"
         if zip_name in existing:
             print(f"[sync] already have {zip_name}")
+            # If the upload was skipped but local staging is missing for a
+            # Release build, fetch from the wiki and stage now. Recovers
+            # users from "synced to Drive but not yet on local mount" limbo.
+            if "Release" in zip_name and not (INCOMING_DIR / label / zip_name).exists():
+                print(f"[sync] staging missing copy from wiki...")
+                data = fetch_zip_bytes(wiki_dir, git_path)
+                _stage_locally(label, zip_name, data)
             continue
         print(f"[sync] new: {zip_name}")
-        label = f"Exporter & Importer {version}"
         if version not in version_folder_cache:
             fid = _get_or_create_folder(service, DELIVERABLES_FOLDER_ID, label)
             version_folder_cache[version] = fid
