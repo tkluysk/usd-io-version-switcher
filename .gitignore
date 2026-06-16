@@ -1,4 +1,5 @@
 builds
+packages/
 .DS_Store
 .drive-cache/
 .venv/

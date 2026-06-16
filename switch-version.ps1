@@ -10,6 +10,8 @@ $DriveCacheDir  = Join-Path $ScriptDir '.drive-cache'
 # them immediately. Treated as additional drive-mode entries below.
 $IncomingDir    = Join-Path $DriveCacheDir 'incoming'
 $SketchUpRoot   = 'C:\Program Files\SketchUp'
+# Output folder for generated plugin-only zip packages (gitignored).
+$PackagesDir    = Join-Path $ScriptDir 'packages'
 
 $script:BuildsDir       = ''
 $script:DriveBuildsDir  = ''
@@ -55,6 +57,17 @@ function Get-ExporterImporterDirs([string]$sketchupDir) {
     return $null
 }
 
+# Locate the Python interpreter to drive sync-releases.py: prefer the repo-local
+# venv, fall back to whatever python is on PATH. Returns $null if none found.
+function Resolve-Python {
+    $venvPy = Join-Path $ScriptDir '.venv\Scripts\python.exe'
+    if (Test-Path $venvPy) { return $venvPy }
+    $py = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $py) { $py = Get-Command python3 -ErrorAction SilentlyContinue }
+    if ($py) { return $py.Source }
+    return $null
+}
+
 # Optionally pull new SkpXyz releases from the GitLab wiki into Drive so the
 # version list below is up to date. Never aborts the switcher on failure.
 function Invoke-MaybeSync {
@@ -64,17 +77,10 @@ function Invoke-MaybeSync {
     $ans = Read-Host "Check GitLab for new versions and sync to Drive? [y/N]"
     if ($ans -notmatch '^[Yy]$') { return }
 
-    $venvPy = Join-Path $ScriptDir '.venv\Scripts\python.exe'
-    if (Test-Path $venvPy) {
-        $pyPath = $venvPy
-    } else {
-        $py = Get-Command python -ErrorAction SilentlyContinue
-        if (-not $py) { $py = Get-Command python3 -ErrorAction SilentlyContinue }
-        if (-not $py) {
-            Write-Host "  python not found - skipping version check." -ForegroundColor Yellow
-            return
-        }
-        $pyPath = $py.Source
+    $pyPath = Resolve-Python
+    if (-not $pyPath) {
+        Write-Host "  python not found - skipping version check." -ForegroundColor Yellow
+        return
     }
 
     Write-Host "Checking GitLab for new releases..."
@@ -321,6 +327,286 @@ function Install-Version([string]$label, [string]$root) {
     Write-Host "Installed: $label -> $(Split-Path -Leaf $sketchupDir)"
 }
 
+# ── plugin-only packaging ───────────────────────────────────────────────────────
+# Builds zip packages that contain ONLY the files needed to install the
+# Importer/Exporter plugin into SketchUp. The standalone Converter (bin/) and
+# all dev artefacts (include/, src/, doc/, cmake/, SketchUpAPI, import libs) are
+# deliberately excluded, so these packages cannot run conversions outside
+# SketchUp.
+
+# Decide whether a build-package entry (path relative to the build root, with
+# forward slashes) belongs in a plugin-only package. This is the single source
+# of truth for "what is a plugin file" — it mirrors what the switcher installs.
+function Test-KeepPluginEntry([string]$rel) {
+    foreach ($prefix in @('lib/Exporters/', 'lib/Importers/', 'lib/usd/', 'lib/su_usd/', 'lib/skp_usd/')) {
+        if ($rel -eq $prefix -or $rel.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    if ($rel -ieq 'CHANGELOG.md') { return $true }
+    # Runtime libraries living directly under lib/ (no further subfolder).
+    if ($rel -match '^lib/[^/]+$') {
+        $name = $rel.Substring(4)
+        $keep = @(
+            'SkpXyz.dll', 'su_usd_ms.dll', 'skp_usd_ms.dll', 'tbb12.dll', 'tbbmalloc.dll',
+            'libSkpXyz.dylib', 'libsu_usd_ms.dylib', 'libskp_usd_ms.dylib'
+        )
+        if ($keep -contains $name) { return $true }
+        if ($name -match '^libtbb.*\.dylib$') { return $true }
+    }
+    return $false
+}
+
+function Get-PluginInstallText([string]$platform, [string]$version) {
+    if ($platform -eq 'Windows') {
+        return @"
+# SkpXyz USD Plugin for SketchUp - $version (Windows)
+
+This package contains ONLY the SketchUp USD (TUSD) import/export plugin and
+its runtime libraries. The standalone command-line Converter is deliberately
+NOT included; this package cannot run conversions outside SketchUp.
+
+## Install
+
+Copy the plugin DLLs:
+
+    lib\Exporters\UsdExporter.dll
+    lib\Importers\UsdImporter.dll
+
+and the runtime files:
+
+    lib\SkpXyz.dll
+    lib\su_usd_ms.dll
+    lib\tbb12.dll
+    lib\tbbmalloc.dll
+    lib\usd\          (the whole folder)
+
+into BOTH the Exporters and Importers folders of your SketchUp install, e.g.:
+
+    C:\Program Files\SketchUp\SketchUp 2026\SketchUp\Exporters
+    C:\Program Files\SketchUp\SketchUp 2026\SketchUp\Importers
+
+(Older layouts put these directly under the version dir:
+ ...\SketchUp 2024\Exporters and ...\SketchUp 2024\Importers.)
+
+Then launch SketchUp and use File -> Import / Export; choose the TUSD format.
+"@
+    }
+    return @"
+# SkpXyz USD Plugin for SketchUp - $version (macOS)
+
+This package contains ONLY the SketchUp USD (TUSD) import/export plugin and
+its runtime libraries. The standalone command-line Converter is deliberately
+NOT included; this package cannot run conversions outside SketchUp.
+
+## Install
+
+Copy the plugin bundles:
+
+    lib/Exporters/UsdExporter.plugin
+    lib/Importers/UsdImporter.plugin
+
+into:
+
+    <SketchUp.app>/Contents/PlugIns
+
+and the runtime libraries:
+
+    lib/libSkpXyz.dylib
+    lib/libsu_usd_ms.dylib
+    lib/libtbb*.dylib
+
+into:
+
+    <SketchUp.app>/Contents/Frameworks
+
+The Frameworks/usd entry in the SketchUp bundle is a symlink to Resources/usd.
+Back up the existing Resources/usd folder (e.g. to Resources/usd-simlab), then
+copy this package's
+
+    lib/usd
+
+into <SketchUp.app>/Contents/Resources.
+
+You may need to disable macOS security or codesign the copied binaries. Then
+launch SketchUp and use File -> Import / Export; choose the TUSD format.
+"@
+}
+
+# Filter a source release zip into a plugin-only zip, copying only the kept
+# entries. File CONTENT is copied byte-for-byte, so any embedded macOS code
+# signatures stay valid. Note: Windows PowerShell's zip writer stamps entries
+# with an MS-DOS host, so Unix exec bits are not reproduced when a macOS package
+# is built on Windows; that is harmless here (SketchUp dlopen's the plugin
+# binaries, which needs only read access, and the kept set has no symlinks), and
+# INSTALL.md covers codesigning. A macOS package built by switch-version.sh
+# keeps full permissions. Returns the kept count.
+function New-PluginZipFromZip([string]$srcZip, [string]$outZip, [string]$topName, [string]$platform, [string]$version) {
+    Add-Type -AssemblyName System.IO.Compression | Out-Null
+    Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
+
+    if (Test-Path $outZip) { Remove-Item $outZip -Force }
+
+    $kept = 0
+    $src = [System.IO.Compression.ZipFile]::OpenRead($srcZip)
+    try {
+        $out = [System.IO.Compression.ZipFile]::Open($outZip, [System.IO.Compression.ZipArchiveMode]::Create)
+        try {
+            foreach ($entry in $src.Entries) {
+                $slash = $entry.FullName.IndexOf('/')
+                if ($slash -lt 0) { continue }                       # skip stray top-level files
+                $rel = $entry.FullName.Substring($slash + 1)
+                if ([string]::IsNullOrEmpty($rel)) { continue }
+                if (-not (Test-KeepPluginEntry $rel)) { continue }
+
+                $newName = "$topName/$rel"
+                if ($entry.FullName.EndsWith('/')) {
+                    $dst = $out.CreateEntry($newName)
+                    $dst.ExternalAttributes = $entry.ExternalAttributes
+                    continue
+                }
+                $dst = $out.CreateEntry($newName, [System.IO.Compression.CompressionLevel]::Optimal)
+                $dst.ExternalAttributes = $entry.ExternalAttributes
+                $dst.LastWriteTime      = $entry.LastWriteTime
+                $si = $entry.Open(); $do = $dst.Open()
+                try { $si.CopyTo($do) } finally { $do.Dispose(); $si.Dispose() }
+                $kept++
+            }
+
+            $install = $out.CreateEntry("$topName/INSTALL.md", [System.IO.Compression.CompressionLevel]::Optimal)
+            $sw = New-Object System.IO.StreamWriter($install.Open())
+            try { $sw.Write((Get-PluginInstallText $platform $version)) } finally { $sw.Dispose() }
+        } finally { $out.Dispose() }
+    } finally { $src.Dispose() }
+    return $kept
+}
+
+# Fallback when only an extracted build dir is available (local mode, no zip):
+# copy the allow-listed files into a staging tree and compress it. Note that
+# Compress-Archive does not preserve Unix exec bits, so a macOS package built
+# this way on Windows may need its binaries re-signed/chmod'd after extraction.
+function New-PluginZipFromDir([string]$root, [string]$outZip, [string]$topName, [string]$platform, [string]$version) {
+    $lib = Join-Path $root 'lib'
+    if (-not (Test-Path $lib)) { return 0 }
+
+    $stage    = Join-Path ([System.IO.Path]::GetTempPath()) ("usdplugin_" + [System.IO.Path]::GetRandomFileName())
+    $stageTop = Join-Path $stage $topName
+    $stageLib = Join-Path $stageTop 'lib'
+    New-Item -ItemType Directory -Force $stageLib | Out-Null
+
+    $kept = 0
+    foreach ($sub in @('Exporters', 'Importers', 'usd', 'su_usd', 'skp_usd')) {
+        $s = Join-Path $lib $sub
+        if (Test-Path $s) { Copy-Item $s (Join-Path $stageLib $sub) -Recurse -Force; $kept++ }
+    }
+    foreach ($f in (Get-ChildItem $lib -File -ErrorAction SilentlyContinue)) {
+        if (Test-KeepPluginEntry "lib/$($f.Name)") { Copy-Item $f.FullName (Join-Path $stageLib $f.Name) -Force; $kept++ }
+    }
+    $changelog = Join-Path $root 'CHANGELOG.md'
+    if (Test-Path $changelog) { Copy-Item $changelog (Join-Path $stageTop 'CHANGELOG.md') -Force }
+    Set-Content (Join-Path $stageTop 'INSTALL.md') (Get-PluginInstallText $platform $version) -NoNewline
+
+    if ($kept -gt 0) {
+        if (Test-Path $outZip) { Remove-Item $outZip -Force }
+        Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $outZip -Force
+        if ($platform -eq 'macOS') {
+            Write-Host "    note: built from extracted files - macOS binaries may need re-signing after extraction." -ForegroundColor Yellow
+        }
+    }
+    Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+    return $kept
+}
+
+# Generate plugin-only packages (both platforms) for the selected version.
+function Invoke-GeneratePackages([string]$label, [string]$versionRoot) {
+    # Find the folder that holds both platforms' sources. In drive mode the
+    # version root already is that folder; in local mode it is a single
+    # platform's extracted dir, so step up one level.
+    if ($script:SourceMode -eq 'drive') {
+        $verFolder = $versionRoot
+    } else {
+        $verFolder = Split-Path -Parent $versionRoot
+    }
+
+    New-Item -ItemType Directory -Force $PackagesDir | Out-Null
+
+    $platforms = @(
+        @{ Name = 'Windows'; ZipPat = '*win64-Release*.zip';  DirPat = '*win64-Release*' },
+        @{ Name = 'macOS';   ZipPat = '*Darwin-Release*.zip'; DirPat = '*Darwin-Release*' }
+    )
+
+    $made = @()
+    foreach ($p in $platforms) {
+        $srcZip = Get-ChildItem $verFolder -File -Filter $p.ZipPat -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($srcZip) {
+            $top    = [System.IO.Path]::GetFileNameWithoutExtension($srcZip.Name) + '-plugin-only'
+            $outZip = Join-Path $PackagesDir ($top + '.zip')
+            Write-Host "  building $($p.Name) plugin-only package from $($srcZip.Name)..."
+            $kept = New-PluginZipFromZip $srcZip.FullName $outZip $top $p.Name $label
+        } else {
+            $dir = Get-ChildItem $verFolder -Directory -Filter $p.DirPat -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $dir) {
+                Write-Host "  ($($p.Name): no $($p.DirPat) source found - skipped)" -ForegroundColor Yellow
+                continue
+            }
+            $top    = $dir.Name + '-plugin-only'
+            $outZip = Join-Path $PackagesDir ($top + '.zip')
+            Write-Host "  building $($p.Name) plugin-only package from $($dir.Name)\..."
+            $kept = New-PluginZipFromDir $dir.FullName $outZip $top $p.Name $label
+        }
+
+        if ($kept -gt 0) {
+            $made += $outZip
+            Write-Host "    -> packages\$(Split-Path -Leaf $outZip)  ($kept plugin items)" -ForegroundColor Green
+        } else {
+            Write-Host "    ($($p.Name): no plugin files found - skipped)" -ForegroundColor Yellow
+            if (Test-Path $outZip) { Remove-Item $outZip -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    if ($made.Count -eq 0) {
+        Write-Host "No plugin-only packages were generated." -ForegroundColor Yellow
+    } else {
+        Write-Host ""
+        Write-Host "Generated $($made.Count) plugin-only package(s) in $PackagesDir"
+    }
+    return $made
+}
+
+# Push generated plugin-only zips to their per-version Deliverables subfolder on
+# Drive (via sync-releases.py's Drive API path). Never aborts on failure.
+function Invoke-MaybeUpload([string[]]$zips) {
+    if (-not $zips -or $zips.Count -eq 0) { return }
+    $syncScript = Join-Path $ScriptDir 'sync-releases.py'
+    if (-not (Test-Path $syncScript)) { return }
+
+    Write-Host ""
+    $ans = Read-Host "Upload the plugin-only package(s) to the Drive Deliverables subfolder? [y/N]"
+    if ($ans -notmatch '^[Yy]$') { return }
+
+    $pyPath = Resolve-Python
+    if (-not $pyPath) {
+        Write-Host "  python not found - skipping upload." -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host "Uploading to Drive..."
+    try {
+        & $pyPath $syncScript --upload-plugin @zips
+        if ($LASTEXITCODE -ne 0) { throw "exit $LASTEXITCODE" }
+    } catch {
+        Write-Host "  (upload failed - packages are still available in $PackagesDir)" -ForegroundColor Yellow
+    }
+}
+
+function Invoke-MaybePackage([string]$label, [string]$versionRoot) {
+    Write-Host ""
+    $ans = Read-Host "Also generate plugin-only zip package(s) for $label (Windows + macOS)? [y/N]"
+    if ($ans -notmatch '^[Yy]$') { return }
+    Write-Host ""
+    Write-Host "Generating plugin-only packages (Converter excluded)..."
+    $made = Invoke-GeneratePackages $label $versionRoot
+    Invoke-MaybeUpload $made
+}
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 Write-Host ""
@@ -367,6 +653,8 @@ foreach ($sketchupDir in $script:SketchUpTargets) {
     }
     Install-Version $script:Versions[$idx] $root
 }
+
+Invoke-MaybePackage $script:Versions[$idx] $script:VersionRoots[$idx]
 
 Write-Host ""
 Read-Host "Press Enter to exit"

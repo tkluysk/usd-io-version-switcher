@@ -238,6 +238,59 @@ def fetch_zip_bytes(wiki_dir: Path, git_path: str) -> bytes:
     return r.stdout
 
 
+def _upload_local_file(service, parent_folder_id: str, path: Path) -> str:
+    """Upload an on-disk file to a Drive folder (resumable)."""
+    from googleapiclient.http import MediaFileUpload
+    media = MediaFileUpload(str(path), mimetype="application/zip",
+                            resumable=True, chunksize=8 * 1024 * 1024)
+    meta = {"name": path.name, "parents": [parent_folder_id]}
+    request = service.files().create(
+        body=meta, media_body=media, fields="id",
+        supportsAllDrives=True,
+    )
+    response = None
+    while response is None:
+        status, response = request.next_chunk()
+        if status:
+            print(f"\r  {int(status.progress() * 100)}%", end="", flush=True)
+    print()
+    return response["id"]
+
+
+def upload_plugins(paths: list[Path]) -> None:
+    """Upload generated plugin-only zips into their matching per-version
+    subfolder under Deliverables (creating the subfolder if needed). Skips any
+    zip already present in that subfolder, so re-runs are idempotent."""
+    service = _gdrive_service()
+    folder_cache: dict[str, str] = {}
+
+    for path in paths:
+        if not path.exists():
+            print(f"[upload] missing: {path}", file=sys.stderr)
+            continue
+        ver_m = re.search(r'SkpXyz-(\d+\.\d+(?:\.\d+)*)-', path.name)
+        if not ver_m:
+            print(f"[upload] cannot derive version from {path.name} - skipped",
+                  file=sys.stderr)
+            continue
+        label = f"Exporter & Importer {ver_m.group(1)}"
+
+        if label not in folder_cache:
+            folder_cache[label] = _get_or_create_folder(
+                service, DELIVERABLES_FOLDER_ID, label)
+            print(f"[upload] folder: {label}")
+        folder_id = folder_cache[label]
+
+        if any(item["name"] == path.name for item in _list_folder(service, folder_id)):
+            print(f"[upload] already on Drive: {path.name}")
+            continue
+
+        mb = path.stat().st_size / 1024 / 1024
+        print(f"[upload] uploading {path.name} ({mb:.0f} MB) to {label}...")
+        _upload_local_file(service, folder_id, path)
+        print(f"[upload] done: {path.name}")
+
+
 def _stage_locally(version_folder: str, zip_name: str, data: bytes) -> None:
     """Mirror a just-uploaded zip into <repo>/.drive-cache/incoming/ so the
     switcher can install it immediately, without waiting for Drive for
@@ -311,10 +364,24 @@ def main():
                     help="Run OAuth flow to store Drive credentials.")
     ap.add_argument("--client-secret", metavar="PATH",
                     help="Path to Google OAuth client secret JSON (only needed for --auth).")
+    ap.add_argument("--upload-plugin", metavar="ZIP", nargs="+",
+                    help="Upload generated plugin-only zip(s) to their per-version "
+                         "Deliverables subfolder, then exit.")
     args = ap.parse_args()
 
     if args.auth:
         do_auth(Path(args.client_secret) if args.client_secret else None)
+        return
+
+    if args.upload_plugin:
+        try:
+            upload_plugins([Path(p) for p in args.upload_plugin])
+        except ImportError:
+            print("[upload] Google client libraries not installed.", file=sys.stderr)
+            sys.exit(1)
+        except RuntimeError as e:
+            print(f"[upload] {e}", file=sys.stderr)
+            sys.exit(1)
         return
 
     try:

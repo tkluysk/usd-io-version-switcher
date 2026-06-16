@@ -10,6 +10,9 @@ DRIVE_CACHE_DIR="$SCRIPT_DIR/.drive-cache"
 # the local mount yet — staged by sync-releases.py so the switcher can use
 # them immediately. Treated as additional drive-mode entries below.
 INCOMING_DIR="$DRIVE_CACHE_DIR/incoming"
+# Output folder for generated plugin-only zip packages (gitignored).
+PACKAGES_DIR="$SCRIPT_DIR/packages"
+MADE_PKGS=()  # plugin-only zips produced by generate_packages, for upload
 
 BUILDS_DIR=""
 SOURCE_MODE=""  # "local" or "drive"
@@ -45,6 +48,19 @@ FRAMEWORKS_DIR=""
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
+# Locate the Python interpreter for sync-releases.py: prefer the repo-local
+# venv, else whatever python is on PATH. Echoes the path; returns 1 if none.
+find_python() {
+    if [[ -x "$SCRIPT_DIR/.venv/bin/python" ]]; then
+        echo "$SCRIPT_DIR/.venv/bin/python"; return 0
+    elif command -v python3 >/dev/null 2>&1; then
+        echo python3; return 0
+    elif command -v python >/dev/null 2>&1; then
+        echo python; return 0
+    fi
+    return 1
+}
+
 # Optionally pull new SkpXyz releases from the GitLab wiki into Drive so the
 # version list below is up to date. Never aborts the switcher on failure.
 maybe_sync() {
@@ -55,14 +71,8 @@ maybe_sync() {
     read -rp "Check GitLab for new versions and sync to Drive? [y/N]: " ans
     [[ "$ans" =~ ^[Yy]$ ]] || return 0
 
-    local py=""
-    if [[ -x "$SCRIPT_DIR/.venv/bin/python" ]]; then
-        py="$SCRIPT_DIR/.venv/bin/python"
-    elif command -v python3 >/dev/null 2>&1; then
-        py=python3
-    elif command -v python >/dev/null 2>&1; then
-        py=python
-    else
+    local py
+    if ! py=$(find_python); then
         echo "  python not found — skipping version check." >&2
         return 0
     fi
@@ -360,6 +370,237 @@ install_version() {
     echo "Installed: $label -> $(basename "$SKETCHUP_APP")"
 }
 
+# ── plugin-only packaging ───────────────────────────────────────────────────────
+# Builds zip packages that contain ONLY the files needed to install the
+# Importer/Exporter plugin into SketchUp. The standalone Converter (bin/) and
+# all dev artefacts (include/, src/, doc/, cmake/, SketchUpAPI, import libs) are
+# deliberately excluded, so these packages cannot run conversions outside
+# SketchUp.
+
+# True if a runtime library living directly under lib/ is a plugin file.
+keep_flat_lib() {
+    case "$1" in
+        SkpXyz.dll|su_usd_ms.dll|skp_usd_ms.dll|tbb12.dll|tbbmalloc.dll) return 0 ;;
+        libSkpXyz.dylib|libsu_usd_ms.dylib|libskp_usd_ms.dylib) return 0 ;;
+        libtbb*.dylib) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+write_install_md() {
+    local platform="$1" version="$2"
+    if [[ "$platform" == "Windows" ]]; then
+        echo "# SkpXyz USD Plugin for SketchUp — $version (Windows)"
+        cat <<'EOF'
+
+This package contains ONLY the SketchUp USD (TUSD) import/export plugin and
+its runtime libraries. The standalone command-line Converter is deliberately
+NOT included; this package cannot run conversions outside SketchUp.
+
+## Install
+
+Copy the plugin DLLs:
+
+    lib\Exporters\UsdExporter.dll
+    lib\Importers\UsdImporter.dll
+
+and the runtime files:
+
+    lib\SkpXyz.dll
+    lib\su_usd_ms.dll
+    lib\tbb12.dll
+    lib\tbbmalloc.dll
+    lib\usd\          (the whole folder)
+
+into BOTH the Exporters and Importers folders of your SketchUp install, e.g.:
+
+    C:\Program Files\SketchUp\SketchUp 2026\SketchUp\Exporters
+    C:\Program Files\SketchUp\SketchUp 2026\SketchUp\Importers
+
+(Older layouts put these directly under the version dir:
+ ...\SketchUp 2024\Exporters and ...\SketchUp 2024\Importers.)
+
+Then launch SketchUp and use File -> Import / Export; choose the TUSD format.
+EOF
+    else
+        echo "# SkpXyz USD Plugin for SketchUp — $version (macOS)"
+        cat <<'EOF'
+
+This package contains ONLY the SketchUp USD (TUSD) import/export plugin and
+its runtime libraries. The standalone command-line Converter is deliberately
+NOT included; this package cannot run conversions outside SketchUp.
+
+## Install
+
+Copy the plugin bundles:
+
+    lib/Exporters/UsdExporter.plugin
+    lib/Importers/UsdImporter.plugin
+
+into:
+
+    <SketchUp.app>/Contents/PlugIns
+
+and the runtime libraries:
+
+    lib/libSkpXyz.dylib
+    lib/libsu_usd_ms.dylib
+    lib/libtbb*.dylib
+
+into:
+
+    <SketchUp.app>/Contents/Frameworks
+
+The Frameworks/usd entry in the SketchUp bundle is a symlink to Resources/usd.
+Back up the existing Resources/usd folder (e.g. to Resources/usd-simlab), then
+copy this package's
+
+    lib/usd
+
+into <SketchUp.app>/Contents/Resources.
+
+You may need to disable macOS security or codesign the copied binaries. Then
+launch SketchUp and use File -> Import / Export; choose the TUSD format.
+EOF
+    fi
+}
+
+# Echo a usable build root dir for a platform, extracting a release zip into a
+# temp dir on demand. Temp dirs are recorded in PKG_TMP_DIRS for cleanup.
+get_platform_root() {
+    local folder="$1" dir_pat="$2" zip_pat="$3" d z tmp
+    d=$(find "$folder" -maxdepth 1 -type d -name "$dir_pat" 2>/dev/null | head -1)
+    if [[ -n "$d" ]]; then echo "$d"; return 0; fi
+    z=$(find "$folder" -maxdepth 1 -type f -name "$zip_pat" 2>/dev/null | head -1)
+    if [[ -n "$z" ]]; then
+        tmp=$(mktemp -d)
+        PKG_TMP_DIRS+=("$tmp")
+        unzip -q -o "$z" -d "$tmp" >/dev/null 2>&1 || return 1
+        d=$(find "$tmp" -maxdepth 1 -type d -name "$dir_pat" 2>/dev/null | head -1)
+        if [[ -n "$d" ]]; then echo "$d"; return 0; fi
+    fi
+    return 1
+}
+
+# Copy the allow-listed plugin files out of a build root and zip them. cp -R and
+# zip -y preserve permissions and symlinks, so macOS bundles stay valid. Echoes
+# the number of plugin items copied.
+build_plugin_package() {
+    local platform="$1" root="$2" top="$3" out="$4" version="$5"
+    local stage dst kept=0 f base sub
+    stage=$(mktemp -d)
+    dst="$stage/$top/lib"
+    mkdir -p "$dst"
+
+    for sub in Exporters Importers usd su_usd skp_usd; do
+        if [[ -e "$root/lib/$sub" ]]; then
+            cp -R "$root/lib/$sub" "$dst/"
+            kept=$((kept + 1))
+        fi
+    done
+    for f in "$root"/lib/*; do
+        [[ -f "$f" ]] || continue
+        base=$(basename "$f")
+        if keep_flat_lib "$base"; then
+            cp "$f" "$dst/"
+            kept=$((kept + 1))
+        fi
+    done
+
+    [[ -f "$root/CHANGELOG.md" ]] && cp "$root/CHANGELOG.md" "$stage/$top/"
+    write_install_md "$platform" "$version" > "$stage/$top/INSTALL.md"
+
+    if (( kept > 0 )); then
+        ( cd "$stage" && zip -ry "$out" "$top" >/dev/null )
+    fi
+    rm -rf "$stage"
+    echo "$kept"
+}
+
+generate_packages() {
+    local label="$1" version_root="$2" folder
+    if [[ "$SOURCE_MODE" == "drive" ]]; then
+        folder="$version_root"
+    else
+        folder="$(dirname "$version_root")"
+    fi
+
+    mkdir -p "$PACKAGES_DIR"
+    PKG_TMP_DIRS=()
+    MADE_PKGS=()
+    local made=0 spec pname dpat zpat root top out kept t
+
+    # name | extracted-dir glob | release-zip glob
+    local specs=(
+        "Windows|*win64-Release*|*win64-Release*.zip"
+        "macOS|*Darwin-Release*|*Darwin-Release*.zip"
+    )
+    for spec in "${specs[@]}"; do
+        IFS='|' read -r pname dpat zpat <<<"$spec"
+        if ! root=$(get_platform_root "$folder" "$dpat" "$zpat"); then
+            echo "  ($pname: no source found — skipped)"
+            continue
+        fi
+        top="$(basename "$root")-plugin-only"
+        out="$PACKAGES_DIR/$top.zip"
+        echo "  building $pname plugin-only package from $(basename "$root")..."
+        rm -f "$out"
+        kept=$(build_plugin_package "$pname" "$root" "$top" "$out" "$label")
+        if (( kept > 0 )); then
+            made=$((made + 1))
+            MADE_PKGS+=("$out")
+            echo "    -> packages/$top.zip  ($kept plugin items)"
+        else
+            echo "    ($pname: no plugin files found — skipped)"
+            rm -f "$out"
+        fi
+    done
+
+    for t in "${PKG_TMP_DIRS[@]:-}"; do
+        [[ -n "$t" ]] && rm -rf "$t"
+    done
+
+    if (( made == 0 )); then
+        echo "No plugin-only packages were generated."
+    else
+        echo ""
+        echo "Generated $made plugin-only package(s) in $PACKAGES_DIR"
+    fi
+}
+
+# Push generated plugin-only zips to their per-version Deliverables subfolder on
+# Drive (via sync-releases.py's Drive API path). Never aborts on failure.
+maybe_upload() {
+    local sync_script="$SCRIPT_DIR/sync-releases.py" ans py
+    [[ ${#MADE_PKGS[@]} -eq 0 ]] && return 0
+    [[ -f "$sync_script" ]] || return 0
+
+    echo ""
+    read -rp "Upload the plugin-only package(s) to the Drive Deliverables subfolder? [y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || return 0
+
+    if ! py=$(find_python); then
+        echo "  python not found — skipping upload." >&2
+        return 0
+    fi
+
+    echo "Uploading to Drive..."
+    if ! "$py" "$sync_script" --upload-plugin "${MADE_PKGS[@]}"; then
+        echo "  (upload failed — packages are still available in $PACKAGES_DIR)" >&2
+    fi
+}
+
+maybe_package() {
+    local label="$1" version_root="$2" ans
+    echo ""
+    read -rp "Also generate plugin-only zip package(s) for $label (Windows + macOS)? [y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || return 0
+    echo ""
+    echo "Generating plugin-only packages (Converter excluded)..."
+    generate_packages "$label" "$version_root"
+    maybe_upload
+}
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 echo ""
@@ -403,3 +644,5 @@ for SKETCHUP_APP in "${SKETCHUP_TARGETS[@]}"; do
     fi
     install_version "${VERSIONS[$idx]}" "$root"
 done
+
+maybe_package "${VERSIONS[$idx]}" "${VERSION_ROOTS[$idx]}"

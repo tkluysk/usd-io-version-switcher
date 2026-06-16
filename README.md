@@ -12,7 +12,7 @@ folder or from the JCube `Deliverables` folder on Google Drive.
 | `switch-version.sh`    | macOS switcher.                                                          |
 | `Launch Switcher.bat`  | Windows entry point — UAC-elevates and runs the PS1.                     |
 | `USD IO Switcher.app/` | macOS entry point — Finder-launchable wrapper around `switch-version.sh`. |
-| `sync-releases.py`     | Mirrors new SkpXyz zips from the GitLab wiki into the Drive Deliverables folder. |
+| `sync-releases.py`     | Mirrors new SkpXyz zips from the GitLab wiki into the Drive Deliverables folder; also uploads generated plugin-only packages (`--upload-plugin`). |
 
 ## Using the switcher
 
@@ -53,6 +53,43 @@ inside the repo.
 
 Run `switch-version.sh` (or double-click `USD IO Switcher.app`). The
 script targets the SketchUp apps hard-coded near the top of the file.
+
+## Plugin-only packages (optional)
+
+After installing a version, the switcher offers to build **plugin-only zip
+packages** for it:
+
+```
+Also generate plugin-only zip package(s) for <version> (Windows + macOS)? [y/N]
+```
+
+These packages contain only what's needed to install the SketchUp USD (TUSD)
+import/export plugin — the `lib/Exporters`, `lib/Importers`, runtime libraries
+and `usd/` resources the switcher itself installs — plus a generated
+`INSTALL.md`. The standalone command-line **Converter** (`bin/`) and all dev
+artefacts (`include/`, `src/`, `doc/`, `cmake/`, the bundled `SketchUpAPI`,
+import libs) are deliberately excluded, so a plugin-only package cannot run
+conversions outside SketchUp.
+
+- Both `win64-Release` and `Darwin-Release` are packaged regardless of which OS
+  you run the switcher on; Debug builds are ignored.
+- Output goes to `packages/` in the repo (gitignored), named
+  `SkpXyz-<ver>-<hash>-<platform>-Release-plugin-only.zip`.
+- File contents are copied byte-for-byte, so existing macOS code signatures
+  stay intact. When the macOS package is built on Windows, Unix exec bits are
+  not reproduced (harmless — SketchUp loads the plugin binaries via `dlopen`,
+  and `INSTALL.md` covers codesigning); build it on macOS for full permissions.
+
+The switcher then offers to **upload** the generated zips to Drive:
+
+```
+Upload the plugin-only package(s) to the Drive Deliverables subfolder? [y/N]
+```
+
+Upload uses the same Drive API path as the sync step below (so the one-time
+setup there is required), placing each zip in its matching
+`Exporter & Importer <version>` Deliverables subfolder. Re-runs are idempotent —
+a zip already present on Drive is skipped.
 
 ## sync-releases.py (optional)
 
