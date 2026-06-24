@@ -48,25 +48,39 @@ CLIENT_SECRET_FILE = Path.home() / ".config" / "usd-switcher" / "gdrive-client-s
 # ── Drive auth ────────────────────────────────────────────────────────────────
 
 def _gdrive_service():
+    from google.auth.exceptions import RefreshError
     from google.oauth2.credentials import Credentials
-    from google_auth_oauthlib.flow import InstalledAppFlow
     from googleapiclient.discovery import build
 
-    if GDRIVE_CREDS_FILE.exists():
-        # Load whatever scopes the file already has rather than forcing SCOPES,
-        # so a token broadened by another tool (e.g. a sibling repo that also
-        # needs Sheets) doesn't get narrowed back to Drive-only on refresh.
-        creds = Credentials.from_authorized_user_file(str(GDRIVE_CREDS_FILE))
-        if not creds.valid:
-            if creds.expired and creds.refresh_token:
-                from google.auth.transport.requests import Request
-                creds.refresh(Request())
-                _save_creds(creds)
-        return build("drive", "v3", credentials=creds)
+    if not GDRIVE_CREDS_FILE.exists():
+        raise RuntimeError(
+            "Not authenticated. Run:  python3 sync-releases.py --auth"
+        )
 
-    raise RuntimeError(
-        "Not authenticated. Run:  python3 sync-releases.py --auth"
-    )
+    # Load whatever scopes the file already has rather than forcing SCOPES,
+    # so a token broadened by another tool (e.g. a sibling repo that also
+    # needs Sheets) doesn't get narrowed back to Drive-only on refresh.
+    creds = Credentials.from_authorized_user_file(str(GDRIVE_CREDS_FILE))
+    if not creds.valid and creds.expired and creds.refresh_token:
+        from google.auth.transport.requests import Request
+        try:
+            creds.refresh(Request())
+            _save_creds(creds)
+        except RefreshError as e:
+            # Refresh tokens for OAuth clients still in "Testing" status are
+            # revoked by Google after 7 days, surfacing as invalid_grant here.
+            # Self-heal by re-running the browser auth flow.
+            if "invalid_grant" not in str(e):
+                raise
+            print(
+                "[auth] Refresh token revoked or expired - re-running browser auth.\n"
+                "       (Google caps refresh tokens at 7 days for Testing-status OAuth\n"
+                "        clients. Publish the OAuth app on Mergence GCP to remove the cap.)",
+                file=sys.stderr,
+            )
+            do_auth()
+            creds = Credentials.from_authorized_user_file(str(GDRIVE_CREDS_FILE))
+    return build("drive", "v3", credentials=creds)
 
 
 def _save_creds(creds):
@@ -90,10 +104,13 @@ def do_auth(client_secret_path: Path | None = None):
     flow = InstalledAppFlow.from_client_secrets_file(str(src), SCOPES)
     creds = flow.run_local_server(port=0)
     _save_creds(creds)
-    # Also copy the client secret to config dir for future token refreshes
-    import shutil
-    CLIENT_SECRET_FILE.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, CLIENT_SECRET_FILE)
+    # Copy the client secret to its canonical location for future refreshes,
+    # unless src already IS the canonical location (Windows shutil.copy2 of a
+    # file onto itself raises a sharing violation).
+    if src.resolve() != CLIENT_SECRET_FILE.resolve():
+        import shutil
+        CLIENT_SECRET_FILE.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, CLIENT_SECRET_FILE)
     print(f"Credentials saved to {GDRIVE_CREDS_FILE}")
 
 

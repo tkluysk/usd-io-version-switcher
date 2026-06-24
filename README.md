@@ -152,6 +152,25 @@ versions. The setup below is required for that to work.
    These file names are the canonical location — other repos read the
    same files; keep the names intact when copying between machines.
 
+### Re-auth cadence
+
+The Mergence GCP OAuth client is currently in **"Testing"** status,
+and Google caps refresh tokens for Testing-status clients at **7 days**
+— after that, any refresh call fails with `invalid_grant: Token has
+been expired or revoked.`
+
+`sync-releases.py` self-heals: when it sees `invalid_grant` it
+automatically re-launches the browser auth flow, then continues the
+sync. You'll see a one-line `[auth] Refresh token revoked or expired
+— re-running browser auth.` message in the terminal and a browser
+window will pop up; sign in again and it carries on. The 7-day cadence
+is therefore expected, not a bug.
+
+To make it stop: publish the OAuth app on Mergence GCP (console
+→ APIs & Services → OAuth consent screen → Publish app). Drive is a
+sensitive scope so Google will ask for verification — that's the only
+way to remove the 7-day cap.
+
 ### Daily use
 
 Easiest is to answer `y` at the switcher's startup prompt. To run it
