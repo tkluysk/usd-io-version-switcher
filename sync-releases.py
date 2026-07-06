@@ -37,6 +37,11 @@ GDRIVE_CREDS_FILE = Path.home() / ".config" / "usd-switcher" / "gdrive-credentia
 SCRIPT_DIR    = Path(__file__).resolve().parent
 INCOMING_DIR  = SCRIPT_DIR / ".drive-cache" / "incoming"
 
+# Path relative to a Drive-for-Desktop mount root that identifies our
+# Deliverables folder. Used to auto-detect where Drive is mounted so we can
+# prune staging entries the mount has caught up on.
+DRIVE_REL_PATH = Path("My Drive") / "Projects & Clients" / "JCube" / "Deliverables"
+
 # Drive folder ID for the Deliverables folder
 DELIVERABLES_FOLDER_ID = "1uh930UJISCCTwvV1Xk2Fdgo7Y_I-D8zH"
 
@@ -320,11 +325,67 @@ def _stage_locally(version_folder: str, zip_name: str, data: bytes) -> None:
     print(f"[sync] staged: {rel}")
 
 
+def _find_drive_mount() -> Path | None:
+    """Best-effort locate the local Google Drive for Desktop mount holding the
+    Deliverables folder. Returns None if not mounted (e.g. Drive for Desktop
+    isn't running or isn't signed in on this machine)."""
+    if sys.platform == "win32":
+        import string
+        for letter in string.ascii_uppercase:
+            candidate = Path(f"{letter}:/") / DRIVE_REL_PATH
+            try:
+                if candidate.is_dir():
+                    return candidate
+            except OSError:
+                pass
+        return None
+    # macOS: ~/Library/CloudStorage/GoogleDrive-*/<rel>
+    cloud = Path.home() / "Library" / "CloudStorage"
+    if not cloud.exists():
+        return None
+    for entry in cloud.iterdir():
+        if entry.name.startswith("GoogleDrive-"):
+            candidate = entry / DRIVE_REL_PATH
+            if candidate.is_dir():
+                return candidate
+    return None
+
+
+def _prune_incoming(mount: Path | None) -> None:
+    """Remove staged zips that Drive for Desktop has now surfaced on the local
+    mount (making the staging copy redundant). No-op when the mount isn't
+    detected — we can't verify what's redundant without it."""
+    if mount is None or not INCOMING_DIR.exists():
+        return
+    removed = 0
+    for ver_dir in list(INCOMING_DIR.iterdir()):
+        if not ver_dir.is_dir():
+            continue
+        mount_ver = mount / ver_dir.name
+        for zip_file in list(ver_dir.iterdir()):
+            if (mount_ver / zip_file.name).is_file():
+                zip_file.unlink()
+                removed += 1
+        try:
+            ver_dir.rmdir()  # only removes if empty
+        except OSError:
+            pass
+    try:
+        INCOMING_DIR.rmdir()
+    except OSError:
+        pass
+    if removed:
+        print(f"[sync] pruned {removed} staged zip(s) already on the local Drive mount")
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def sync():
     gitlab_token = _read_gitlab_token()
     service = _gdrive_service()
+
+    mount = _find_drive_mount()
+    _prune_incoming(mount)
 
     wiki_dir = ensure_wiki(gitlab_token)
     md_path = wiki_dir / "Installation.md"
@@ -346,12 +407,17 @@ def sync():
         if zip_name in existing:
             print(f"[sync] already have {zip_name}")
             # If the upload was skipped but local staging is missing for a
-            # Release build, fetch from the wiki and stage now. Recovers
-            # users from "synced to Drive but not yet on local mount" limbo.
-            if "Release" in zip_name and not (INCOMING_DIR / label / zip_name).exists():
-                print(f"[sync] staging missing copy from wiki...")
-                data = fetch_zip_bytes(wiki_dir, git_path)
-                _stage_locally(label, zip_name, data)
+            # Release build AND the mount hasn't surfaced the file either,
+            # fetch from the wiki and stage now. Recovers users from "synced
+            # to Drive but not yet on local mount" limbo. If the mount has
+            # already caught up, staging is redundant — skip it.
+            if "Release" in zip_name:
+                on_mount = mount is not None and (mount / label / zip_name).is_file()
+                staged   = (INCOMING_DIR / label / zip_name).exists()
+                if not on_mount and not staged:
+                    print(f"[sync] staging missing copy from wiki...")
+                    data = fetch_zip_bytes(wiki_dir, git_path)
+                    _stage_locally(label, zip_name, data)
             continue
         print(f"[sync] new: {zip_name}")
         if version not in version_folder_cache:
