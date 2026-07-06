@@ -286,7 +286,11 @@ function Remove-InstalledFiles {
         Safe-Remove (Join-Path $targetDir 'su_usd_ms.dll')
         Safe-Remove (Join-Path $targetDir 'tbb12.dll')
         Safe-Remove (Join-Path $targetDir 'tbbmalloc.dll')
+        # USD data folder rename history: skp_usd (very old) -> usd -> su_usd
+        # (0.7.8+). Clean up whichever name a previous install left behind.
         Safe-Remove (Join-Path $targetDir 'usd')
+        Safe-Remove (Join-Path $targetDir 'su_usd')
+        Safe-Remove (Join-Path $targetDir 'skp_usd')
     }
 
     Safe-Remove (Join-Path $script:ExportersDir '.usd_version')
@@ -314,8 +318,16 @@ function Install-04x([string]$root) {
         Log-Copy (Join-Path $lib 'tbb12.dll')     $targetDir
         Log-Copy (Join-Path $lib 'tbbmalloc.dll') $targetDir
 
-        $usdDir = Join-Path $lib 'usd'
-        if (Test-Path $usdDir) { Log-Copy $usdDir $targetDir }
+        # USD data folder was renamed 'usd' -> 'su_usd' at 0.7.8 (and was
+        # 'skp_usd' in the very early releases). Copy the first one that
+        # exists in this release's lib/.
+        foreach ($name in @('su_usd', 'usd', 'skp_usd')) {
+            $usdDir = Join-Path $lib $name
+            if (Test-Path $usdDir -PathType Container) {
+                Log-Copy $usdDir $targetDir
+                break
+            }
+        }
     }
 }
 
