@@ -14,9 +14,13 @@ INCOMING_DIR="$DRIVE_CACHE_DIR/incoming"
 PACKAGES_DIR="$SCRIPT_DIR/packages"
 MADE_PKGS=()  # plugin-only zips produced by generate_packages, for upload
 
-BUILDS_DIR=""
-SOURCE_MODE=""     # "local" or "drive"
-DRIVE_MOUNT_OK=0   # a live Drive for Desktop mount was found
+# Discovered build source roots, in priority order (newest/most-local first).
+# Each entry pairs a directory with its kind: "dir" = folders hold an
+# already-extracted *Darwin* root; "zip" = folders hold a *Darwin*.zip to
+# extract on demand into .drive-cache/.
+SOURCE_DIRS=()
+SOURCE_KINDS=()
+DRIVE_MOUNT_OK=0   # a live Drive for Desktop mount was found (else API fallback)
 
 SKETCHUP_APPS=()
 SKETCHUP_TARGETS=()
@@ -43,6 +47,7 @@ discover_sketchup_apps() {
 
 VERSIONS=()
 VERSION_ROOTS=()
+VERSION_KINDS=()  # "dir" (extracted root) or "zip" (folder w/ Darwin zip), per entry
 
 PLUGINS_DIR=""
 FRAMEWORKS_DIR=""
@@ -161,53 +166,34 @@ find_drive_builds_dir() {
     return 1
 }
 
-pick_source() {
-    local local_ok=0 mount_ok=0 incoming_ok=0 drive_ok=0 drive_dir drive_label
-    [[ -d "$LOCAL_BUILDS_DIR" ]] && local_ok=1
+# Gather every place a build might live, in priority order (newest/most-local
+# first): freshly-synced staging, the checked-in builds/ folder, then the live
+# Drive mount as a fallback. list_versions dedups by label across all of them,
+# so there's no source to pick — the union is the source. When no Drive mount
+# is present, list_versions falls back to the Drive API as a last resort.
+discover_sources() {
+    if [[ -d "$INCOMING_DIR" ]]; then
+        SOURCE_DIRS+=("$INCOMING_DIR");       SOURCE_KINDS+=("zip")
+    fi
+    if [[ -d "$LOCAL_BUILDS_DIR" ]]; then
+        # Resolve symlinks so find works correctly.
+        SOURCE_DIRS+=("$(cd "$LOCAL_BUILDS_DIR" && pwd -P)"); SOURCE_KINDS+=("dir")
+    fi
     DRIVE_BUILDS_DIR="$(find_drive_builds_dir || true)"
-    [[ -n "$DRIVE_BUILDS_DIR" ]] && mount_ok=1
-    DRIVE_MOUNT_OK=$mount_ok
-    # Freshly-synced Release zips staged by sync-releases.py under
-    # .drive-cache/incoming let drive mode work even when Drive for Desktop
-    # hasn't surfaced them yet — or isn't mounted on this machine at all.
-    if [[ -d "$INCOMING_DIR" ]] && find "$INCOMING_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | grep -q .; then
-        incoming_ok=1
-    fi
-    (( mount_ok || incoming_ok )) && drive_ok=1
-
-    # Resolve symlinks so find works correctly
-    (( local_ok )) && LOCAL_BUILDS_DIR="$(cd "$LOCAL_BUILDS_DIR" && pwd -P)"
-
-    # In drive mode, enumerate from the Drive mount when present, else the local
-    # staging dir (its subfolders are listed the same way).
-    if (( mount_ok )); then
-        drive_dir="$DRIVE_BUILDS_DIR"; drive_label="$DRIVE_BUILDS_DIR"
-    else
-        drive_dir="$INCOMING_DIR"; drive_label="staged downloads ($INCOMING_DIR)"
+    if [[ -n "$DRIVE_BUILDS_DIR" ]]; then
+        SOURCE_DIRS+=("$DRIVE_BUILDS_DIR");   SOURCE_KINDS+=("zip")
+        DRIVE_MOUNT_OK=1
     fi
 
-    if (( local_ok && ! drive_ok )); then
-        SOURCE_MODE="local"; BUILDS_DIR="$LOCAL_BUILDS_DIR"; return
-    fi
-    if (( drive_ok && ! local_ok )); then
-        SOURCE_MODE="drive"; BUILDS_DIR="$drive_dir"; return
-    fi
-    (( local_ok || drive_ok )) || die "No sources found: local builds dir ($LOCAL_BUILDS_DIR), a Google Drive mount with '$DRIVE_REL_PATH', or staged downloads in $INCOMING_DIR."
-
-    echo "Select source:"
-    echo "  1) Local builds folder ($LOCAL_BUILDS_DIR)"
-    echo "  2) Google Drive ($drive_label)"
-    echo ""
-    read -rp "Select source [1-2]: " choice
-    case "$choice" in
-        1) SOURCE_MODE="local"; BUILDS_DIR="$LOCAL_BUILDS_DIR" ;;
-        2) SOURCE_MODE="drive"; BUILDS_DIR="$drive_dir" ;;
-        *) die "Invalid selection: $choice" ;;
-    esac
+    # The Drive API can surface versions even with no local source at all, so
+    # don't die yet if it's available — list_versions will try it.
+    (( ${#SOURCE_DIRS[@]} > 0 )) || drive_api_available || \
+        die "No build sources found (looked in $LOCAL_BUILDS_DIR, $INCOMING_DIR, and Google Drive)."
 }
 
-# Returns a Darwin root directory for the given version folder, extracting from
-# a zip into the drive cache on demand when in drive mode.
+# Returns a Darwin root directory for the given version folder. If the folder
+# already holds an extracted *Darwin* root, that's returned as-is; otherwise a
+# *Darwin*.zip is extracted on demand into .drive-cache/.
 resolve_darwin_root() {
     local dir="$1"
     local darwin_root
@@ -216,118 +202,127 @@ resolve_darwin_root() {
         echo "$darwin_root"; return 0
     fi
 
-    if [[ "$SOURCE_MODE" == "drive" ]]; then
-        local zip
-        zip=$(find "$dir" -maxdepth 1 -type f -name "*Darwin*.zip" 2>/dev/null | head -1)
-        [[ -z "$zip" ]] && return 1
+    local zip
+    zip=$(find "$dir" -maxdepth 1 -type f -name "*Darwin*.zip" 2>/dev/null | head -1)
+    [[ -z "$zip" ]] && return 1
 
-        local label cache
-        # Use the dir path relative to its source root as a stable cache key.
-        # Staged dirs live under $INCOMING_DIR; Drive-mount dirs under $DRIVE_BUILDS_DIR.
-        if [[ "$dir" == "$INCOMING_DIR"/* ]]; then
-            label="${dir#$INCOMING_DIR/}"
-        else
-            label="${dir#$DRIVE_BUILDS_DIR/}"
-        fi
-        cache="$DRIVE_CACHE_DIR/${label//\//__}"
+    local label cache
+    # Use the dir path relative to its source root as a stable cache key.
+    # Staged dirs live under $INCOMING_DIR; Drive-mount dirs under $DRIVE_BUILDS_DIR.
+    if [[ "$dir" == "$INCOMING_DIR"/* ]]; then
+        label="${dir#$INCOMING_DIR/}"
+    elif [[ -n "$DRIVE_BUILDS_DIR" && "$dir" == "$DRIVE_BUILDS_DIR"/* ]]; then
+        label="${dir#$DRIVE_BUILDS_DIR/}"
+    else
+        label="$(basename "$dir")"
+    fi
+    cache="$DRIVE_CACHE_DIR/${label//\//__}"
+    darwin_root=$(find "$cache" -maxdepth 1 -type d -name "*Darwin*" 2>/dev/null | head -1)
+    if [[ -z "$darwin_root" ]]; then
+        mkdir -p "$cache"
+        echo "  extracting $(basename "$zip") -> .drive-cache/$label/" >&2
+        unzip -q -o "$zip" -d "$cache" >&2 || return 1
         darwin_root=$(find "$cache" -maxdepth 1 -type d -name "*Darwin*" 2>/dev/null | head -1)
-        if [[ -z "$darwin_root" ]]; then
-            mkdir -p "$cache"
-            echo "  extracting $(basename "$zip") -> .drive-cache/$label/" >&2
-            unzip -q -o "$zip" -d "$cache" >&2 || return 1
-            darwin_root=$(find "$cache" -maxdepth 1 -type d -name "*Darwin*" 2>/dev/null | head -1)
-        fi
-        [[ -n "$darwin_root" ]] && echo "$darwin_root" && return 0
     fi
+    [[ -n "$darwin_root" ]] && echo "$darwin_root" && return 0
     return 1
 }
 
-list_drive_entry() {
-    local dir="$1" label="$2"
-    if find "$dir" -maxdepth 1 \( -type d -name "*Darwin*" -o -type f -name "*Darwin*.zip" \) 2>/dev/null | grep -q .; then
-        VERSIONS+=("$label")
-        VERSION_ROOTS+=("$dir")
-        return 0
-    fi
-    return 1
+# True if a folder directly contains an extracted *Darwin* root or a
+# *Darwin*.zip — i.e. it's an installable version folder.
+has_darwin_build() {
+    find "$1" -maxdepth 1 \( -type d -name "*Darwin*" -o -type f -name "*Darwin*.zip" \) 2>/dev/null | grep -q .
 }
 
+# Record a version entry. kind is "dir" (folder holds an extracted Darwin root)
+# or "zip" (folder holds a Darwin zip, extracted lazily at install time).
+add_version() {
+    VERSIONS+=("$1")
+    VERSION_ROOTS+=("$2")
+    VERSION_KINDS+=("$3")
+}
+
+# Collect one installable entry into the pending buffer, unless its label was
+# already claimed by a higher-priority source. Each buffer line is:
+#   <label>\t<kind>\t<root>
+# with the label first so the whole buffer can be `sort -Vr`'d by version.
+_collect_entry() {
+    local label="$1" dir="$2" srckind="$3" root
+    case "$_seen" in *"|$label|"*) return ;; esac
+    if [[ "$srckind" == "dir" ]]; then
+        root=$(find "$dir" -maxdepth 1 -type d -name "*Darwin*" | head -1)
+        [[ -z "$root" ]] && return
+    else
+        root="$dir"
+    fi
+    _pending+=("$label"$'\t'"$srckind"$'\t'"$root")
+    _seen="$_seen|$label|"
+}
+
+# Build a single deduplicated version list across every source in SOURCE_DIRS,
+# then sort it strictly newest-first regardless of source. On a duplicate label
+# the first (highest-priority) source wins — so a freshly-synced build in
+# incoming/ shadows an older copy on the slow Drive mount — but the final list
+# is ordered purely by version.
 list_versions() {
-    local idx=1 added
-    # Plain string of "|label|" tokens; bash 3.2 has no associative arrays.
-    local seen=""
+    local i src srckind dir label sublabel idx=1
+    # bash 3.2: no associative arrays, so dedup via a "|label|" token string.
+    local _seen="" _pending=()
 
-    # Pre-pass: list staged versions (newly-synced zips that Drive for Desktop
-    # may not have surfaced on the local mount yet). Drive mode only.
-    if [[ "$SOURCE_MODE" == "drive" && -d "$INCOMING_DIR" ]]; then
+    for i in "${!SOURCE_DIRS[@]}"; do
+        src="${SOURCE_DIRS[$i]}"; srckind="${SOURCE_KINDS[$i]}"
+        [[ -d "$src" ]] || continue
+
         while IFS= read -r -d '' dir; do
-            local label
             label=$(basename "$dir")
-            if list_drive_entry "$dir" "$label"; then
-                echo "  $idx) $label"
-                seen="$seen|$label|"
-                ((idx++))
-            fi
-        done < <(find "$INCOMING_DIR" -maxdepth 1 -mindepth 1 -type d | sort -Vr | tr '\n' '\0')
-    fi
-
-    while IFS= read -r -d '' dir; do
-        local label
-        label=$(basename "$dir")
-        # Already added from the staging pre-pass — don't list again.
-        case "$seen" in *"|$label|"*) continue ;; esac
-
-        if [[ "$SOURCE_MODE" == "drive" ]]; then
-            # Skip anything older than 0.4.0
+            # Skip anything older than 0.4.0.
             if [[ "$label" =~ [[:space:]]0\.([0-3])\. ]] || [[ "$label" =~ [[:space:]]0\.[0-3]$ ]]; then
                 continue
             fi
-            added=0
-            if list_drive_entry "$dir" "$label"; then
-                echo "  $idx) $label"
-                ((idx++)); added=1
-            fi
-            if (( ! added )); then
-                # Descend one level for variant subfolders (e.g. "Using SketchUp libs")
+            if has_darwin_build "$dir"; then
+                _collect_entry "$label" "$dir" "$srckind"
+            else
+                # Descend one level for variant subfolders (e.g. "Using SketchUp libs").
                 while IFS= read -r -d '' sub; do
-                    local sublabel="$label / $(basename "$sub")"
-                    if list_drive_entry "$sub" "$sublabel"; then
-                        echo "  $idx) $sublabel"
-                        ((idx++))
-                    fi
-                done < <(find "$dir" -maxdepth 1 -mindepth 1 -type d | sort -V | tr '\n' '\0')
+                    has_darwin_build "$sub" || continue
+                    sublabel="$label / $(basename "$sub")"
+                    _collect_entry "$sublabel" "$sub" "$srckind"
+                done < <(find "$dir" -maxdepth 1 -mindepth 1 -type d | tr '\n' '\0')
             fi
-        else
-            if [[ "$label" =~ [[:space:]]0\.([0-3])\. ]] || [[ "$label" =~ [[:space:]]0\.[0-3]$ ]]; then
-                continue
-            fi
-            local darwin_root
-            darwin_root=$(find "$dir" -maxdepth 1 -type d -name "*Darwin*" | head -1)
-            [[ -z "$darwin_root" ]] && continue
-            VERSIONS+=("$label")
-            VERSION_ROOTS+=("$darwin_root")
-            echo "  $idx) $label"
-            ((idx++))
-        fi
-    done < <(find "$BUILDS_DIR" -maxdepth 1 -mindepth 1 -type d | sort -Vr | tr '\n' '\0')
+        done < <(find "$src" -maxdepth 1 -mindepth 1 -type d | tr '\n' '\0')
+    done
 
-    # Drive API fallback (last resort): with no mount, surface versions that
-    # exist on Drive but aren't staged locally. Their root is an "API::<label>"
-    # sentinel, downloaded on demand only if selected.
-    if [[ "$SOURCE_MODE" == "drive" && $DRIVE_MOUNT_OK -eq 0 ]] && drive_api_available; then
+    # Drive API fallback (last resort): with no Drive mount, surface versions
+    # that exist on Drive but aren't staged locally. Buffered like any other
+    # entry (kind "api", root "API::<label>") so they sort in by version;
+    # the actual download happens on demand only if one is selected.
+    if (( ! DRIVE_MOUNT_OK )) && drive_api_available; then
         echo "  checking Drive for more versions..."
         local lbl win dar
         while IFS=$'\t' read -r lbl win dar; do
             [[ -z "$lbl" ]] && continue
-            case "$seen" in *"|$lbl|"*) continue ;; esac
+            case "$_seen" in *"|$lbl|"*) continue ;; esac
             [[ "$dar" == "-" ]] && continue   # need a macOS build to install here
-            VERSIONS+=("$lbl")
-            VERSION_ROOTS+=("API::$lbl")
-            echo "  $idx) $lbl  (Drive)"
-            seen="$seen|$lbl|"
-            ((idx++))
+            if [[ "$lbl" =~ [[:space:]]0\.([0-3])\. ]] || [[ "$lbl" =~ [[:space:]]0\.[0-3]$ ]]; then
+                continue
+            fi
+            _pending+=("$lbl"$'\t'"api"$'\t'"API::$lbl")
+            _seen="$_seen|$lbl|"
         done < <(get_drive_api_versions | sort -Vr)
     fi
+
+    # Sort the merged buffer newest-first by label (version), then publish.
+    local line l_label l_kind l_root
+    while IFS=$'\t' read -r l_label l_kind l_root; do
+        [[ -z "$l_label" ]] && continue
+        add_version "$l_label" "$l_root" "$l_kind"
+        if [[ "$l_kind" == "api" ]]; then
+            echo "  $idx) $l_label  (Drive)"
+        else
+            echo "  $idx) $l_label"
+        fi
+        ((idx++))
+    done < <(printf '%s\n' "${_pending[@]}" | sort -Vr)
 }
 
 current_version() {
@@ -342,8 +337,11 @@ current_version() {
 # ── removal ───────────────────────────────────────────────────────────────────
 
 shorten() {
-    local path="$1"
-    path="${path/#$BUILDS_DIR\//}"
+    local path="$1" src
+    # Strip whichever source root this path lives under.
+    for src in "${SOURCE_DIRS[@]}"; do
+        path="${path/#$src\//}"
+    done
     path="${path/#$DRIVE_CACHE_DIR\//.drive-cache/}"
     path="${path/#$HOME\//~/}"
     if [[ "$path" =~ (SkpXyz-[^/]+/.+) ]]; then
@@ -587,8 +585,10 @@ build_plugin_package() {
 }
 
 generate_packages() {
-    local label="$1" version_root="$2" folder
-    if [[ "$SOURCE_MODE" == "drive" ]]; then
+    local label="$1" version_root="$2" kind="$3" folder
+    # "zip" entries point at the version folder (holds the platform zips);
+    # "dir" entries point at the extracted Darwin root, so step up one level.
+    if [[ "$kind" == "zip" ]]; then
         folder="$version_root"
     else
         folder="$(dirname "$version_root")"
@@ -609,7 +609,7 @@ generate_packages() {
         root=$(get_platform_root "$folder" "$dpat" "$zpat") || root=""
         # Drive API fallback: a platform missing locally (e.g. an API-only
         # version fetched for the other platform's install) is downloaded now.
-        if [[ -z "$root" && "$SOURCE_MODE" == "drive" ]] && drive_api_available; then
+        if [[ -z "$root" ]] && drive_api_available; then
             if dl=$(drive_api_download "$(basename "$folder")" "$apiplat"); then
                 root=$(get_platform_root "$dl" "$dpat" "$zpat") || root=""
             fi
@@ -668,13 +668,13 @@ maybe_upload() {
 }
 
 maybe_package() {
-    local label="$1" version_root="$2" ans
+    local label="$1" version_root="$2" kind="$3" ans
     echo ""
     read -rp "Also generate plugin-only zip package(s) for $label (Windows + macOS)? [y/N]: " ans
     [[ "$ans" =~ ^[Yy]$ ]] || return 0
     echo ""
     echo "Generating plugin-only packages (Converter excluded)..."
-    generate_packages "$label" "$version_root"
+    generate_packages "$label" "$version_root" "$kind"
     maybe_upload
 }
 
@@ -688,18 +688,17 @@ echo ""
 maybe_sync
 echo ""
 
-pick_source
-[[ -d "$BUILDS_DIR" ]] || die "Builds directory not found at: $BUILDS_DIR"
+discover_sources
 
 echo ""
 pick_sketchup
 
 echo ""
-echo "Available versions (source: $SOURCE_MODE):"
+echo "Available versions:"
 list_versions
 echo ""
 
-[[ ${#VERSIONS[@]} -eq 0 ]] && die "No build versions found in $BUILDS_DIR"
+[[ ${#VERSIONS[@]} -eq 0 ]] && die "No build versions found."
 
 read -rp "Select version [1-${#VERSIONS[@]}]: " choice
 
@@ -709,9 +708,10 @@ fi
 
 idx=$(( choice - 1 ))
 
-# Resolve a Drive-API-only selection to a locally staged folder once, up front,
-# so both the install loop and packaging reuse the same download.
-if [[ "${VERSION_ROOTS[$idx]}" == API::* ]]; then
+# An "api" selection has no local copy: download it into incoming/ first, which
+# turns it into an ordinary "zip" entry pointing at the staged folder. Done once,
+# up front, so both the install loop and packaging reuse the same download.
+if [[ "${VERSION_KINDS[$idx]}" == "api" ]]; then
     api_label="${VERSION_ROOTS[$idx]#API::}"
     echo ""
     echo "Fetching $api_label from Drive (no local copy found)..."
@@ -719,6 +719,15 @@ if [[ "${VERSION_ROOTS[$idx]}" == API::* ]]; then
         die "Could not download $api_label from Drive."
     fi
     VERSION_ROOTS[$idx]="$dl"
+    VERSION_KINDS[$idx]="zip"
+fi
+
+# Resolve the Darwin root once (extracts a zip entry into .drive-cache/ on
+# demand); "dir" entries already point at the extracted root.
+darwin_root="${VERSION_ROOTS[$idx]}"
+if [[ "${VERSION_KINDS[$idx]}" == "zip" ]]; then
+    darwin_root=$(resolve_darwin_root "$darwin_root") \
+        || die "Could not extract Darwin build for ${VERSIONS[$idx]}"
 fi
 
 for SKETCHUP_APP in "${SKETCHUP_TARGETS[@]}"; do
@@ -727,11 +736,7 @@ for SKETCHUP_APP in "${SKETCHUP_TARGETS[@]}"; do
     echo ""
     echo ">>> $(basename "$SKETCHUP_APP")"
     echo "    Currently installed: $(current_version)"
-    root="${VERSION_ROOTS[$idx]}"
-    if [[ "$SOURCE_MODE" == "drive" ]]; then
-        root=$(resolve_darwin_root "$root") || die "Could not extract Darwin build for ${VERSIONS[$idx]}"
-    fi
-    install_version "${VERSIONS[$idx]}" "$root"
+    install_version "${VERSIONS[$idx]}" "$darwin_root"
 done
 
-maybe_package "${VERSIONS[$idx]}" "${VERSION_ROOTS[$idx]}"
+maybe_package "${VERSIONS[$idx]}" "${VERSION_ROOTS[$idx]}" "${VERSION_KINDS[$idx]}"
