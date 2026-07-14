@@ -49,6 +49,11 @@ The switcher auto-detects:
 When sourcing from Drive, zips are extracted on demand to `.drive-cache\`
 inside the repo.
 
+Versions just pulled by the sync step are staged under
+`.drive-cache\incoming\` and count as a Drive source on their own — so a
+freshly-synced build is usable immediately even when Google Drive for Desktop
+isn't mounted (or hasn't surfaced the file yet).
+
 ### macOS
 
 Run `switch-version.sh` (or double-click `USD IO Switcher.app`). The

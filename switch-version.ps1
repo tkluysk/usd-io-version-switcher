@@ -95,26 +95,37 @@ function Invoke-MaybeSync {
 function Select-Source {
     $localOk = Test-Path $LocalBuildsDir -PathType Container
     $script:DriveBuildsDir = Find-DriveBuildsDir
-    $driveOk = [bool]$script:DriveBuildsDir
+    $mountOk = [bool]$script:DriveBuildsDir
+    # Freshly-synced Release zips staged by sync-releases.py under
+    # .drive-cache\incoming let drive mode work even when Drive for Desktop
+    # hasn't surfaced them yet — or isn't mounted on this machine at all.
+    $incomingOk = (Test-Path $IncomingDir) -and
+                  [bool](Get-ChildItem $IncomingDir -Directory -ErrorAction SilentlyContinue | Select-Object -First 1)
+    $driveOk = $mountOk -or $incomingOk
+
+    # In drive mode, enumerate from the Drive mount when present, else fall back
+    # to the local staging dir (its subfolders are listed the same way).
+    $driveDir   = if ($mountOk) { $script:DriveBuildsDir } else { $IncomingDir }
+    $driveLabel = if ($mountOk) { $script:DriveBuildsDir } else { "staged downloads ($IncomingDir)" }
 
     if ($localOk -and -not $driveOk) {
         $script:SourceMode = 'local'; $script:BuildsDir = $LocalBuildsDir; return
     }
     if ($driveOk -and -not $localOk) {
-        $script:SourceMode = 'drive'; $script:BuildsDir = $script:DriveBuildsDir; return
+        $script:SourceMode = 'drive'; $script:BuildsDir = $driveDir; return
     }
     if (-not $localOk -and -not $driveOk) {
-        Die "Neither local builds dir ($LocalBuildsDir) nor a Google Drive mount with '$DriveRelPath' was found."
+        Die "No sources found: local builds dir ($LocalBuildsDir), a Google Drive mount with '$DriveRelPath', or staged downloads in $IncomingDir."
     }
 
     Write-Host "Select source:"
     Write-Host "  1) Local builds folder ($LocalBuildsDir)"
-    Write-Host "  2) Google Drive ($script:DriveBuildsDir)"
+    Write-Host "  2) Google Drive ($driveLabel)"
     Write-Host ""
     $choice = Read-Host "Select source [1-2]"
     switch ($choice) {
         '1' { $script:SourceMode = 'local'; $script:BuildsDir = $LocalBuildsDir }
-        '2' { $script:SourceMode = 'drive'; $script:BuildsDir = $script:DriveBuildsDir }
+        '2' { $script:SourceMode = 'drive'; $script:BuildsDir = $driveDir }
         default { Die "Invalid selection: $choice" }
     }
 }

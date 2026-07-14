@@ -127,30 +127,45 @@ find_drive_builds_dir() {
 }
 
 pick_source() {
-    local local_ok=0 drive_ok=0
+    local local_ok=0 mount_ok=0 incoming_ok=0 drive_ok=0 drive_dir drive_label
     [[ -d "$LOCAL_BUILDS_DIR" ]] && local_ok=1
     DRIVE_BUILDS_DIR="$(find_drive_builds_dir || true)"
-    [[ -n "$DRIVE_BUILDS_DIR" ]] && drive_ok=1
+    [[ -n "$DRIVE_BUILDS_DIR" ]] && mount_ok=1
+    # Freshly-synced Release zips staged by sync-releases.py under
+    # .drive-cache/incoming let drive mode work even when Drive for Desktop
+    # hasn't surfaced them yet — or isn't mounted on this machine at all.
+    if [[ -d "$INCOMING_DIR" ]] && find "$INCOMING_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | grep -q .; then
+        incoming_ok=1
+    fi
+    (( mount_ok || incoming_ok )) && drive_ok=1
 
     # Resolve symlinks so find works correctly
     (( local_ok )) && LOCAL_BUILDS_DIR="$(cd "$LOCAL_BUILDS_DIR" && pwd -P)"
+
+    # In drive mode, enumerate from the Drive mount when present, else the local
+    # staging dir (its subfolders are listed the same way).
+    if (( mount_ok )); then
+        drive_dir="$DRIVE_BUILDS_DIR"; drive_label="$DRIVE_BUILDS_DIR"
+    else
+        drive_dir="$INCOMING_DIR"; drive_label="staged downloads ($INCOMING_DIR)"
+    fi
 
     if (( local_ok && ! drive_ok )); then
         SOURCE_MODE="local"; BUILDS_DIR="$LOCAL_BUILDS_DIR"; return
     fi
     if (( drive_ok && ! local_ok )); then
-        SOURCE_MODE="drive"; BUILDS_DIR="$DRIVE_BUILDS_DIR"; return
+        SOURCE_MODE="drive"; BUILDS_DIR="$drive_dir"; return
     fi
-    (( local_ok || drive_ok )) || die "Neither local builds dir ($LOCAL_BUILDS_DIR) nor Drive dir ($DRIVE_BUILDS_DIR) found."
+    (( local_ok || drive_ok )) || die "No sources found: local builds dir ($LOCAL_BUILDS_DIR), a Google Drive mount with '$DRIVE_REL_PATH', or staged downloads in $INCOMING_DIR."
 
     echo "Select source:"
     echo "  1) Local builds folder ($LOCAL_BUILDS_DIR)"
-    echo "  2) Google Drive ($DRIVE_BUILDS_DIR)"
+    echo "  2) Google Drive ($drive_label)"
     echo ""
     read -rp "Select source [1-2]: " choice
     case "$choice" in
         1) SOURCE_MODE="local"; BUILDS_DIR="$LOCAL_BUILDS_DIR" ;;
-        2) SOURCE_MODE="drive"; BUILDS_DIR="$DRIVE_BUILDS_DIR" ;;
+        2) SOURCE_MODE="drive"; BUILDS_DIR="$drive_dir" ;;
         *) die "Invalid selection: $choice" ;;
     esac
 }
