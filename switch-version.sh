@@ -20,7 +20,6 @@ MADE_PKGS=()  # plugin-only zips produced by generate_packages, for upload
 # extract on demand into .drive-cache/.
 SOURCE_DIRS=()
 SOURCE_KINDS=()
-DRIVE_MOUNT_OK=0   # a live Drive for Desktop mount was found (else API fallback)
 
 SKETCHUP_APPS=()
 SKETCHUP_TARGETS=()
@@ -169,8 +168,8 @@ find_drive_builds_dir() {
 # Gather every place a build might live, in priority order (newest/most-local
 # first): freshly-synced staging, the checked-in builds/ folder, then the live
 # Drive mount as a fallback. list_versions dedups by label across all of them,
-# so there's no source to pick — the union is the source. When no Drive mount
-# is present, list_versions falls back to the Drive API as a last resort.
+# so there's no source to pick — the union is the source. list_versions also
+# consults the Drive API as a last resort for versions not visible locally.
 discover_sources() {
     if [[ -d "$INCOMING_DIR" ]]; then
         SOURCE_DIRS+=("$INCOMING_DIR");       SOURCE_KINDS+=("zip")
@@ -182,7 +181,6 @@ discover_sources() {
     DRIVE_BUILDS_DIR="$(find_drive_builds_dir || true)"
     if [[ -n "$DRIVE_BUILDS_DIR" ]]; then
         SOURCE_DIRS+=("$DRIVE_BUILDS_DIR");   SOURCE_KINDS+=("zip")
-        DRIVE_MOUNT_OK=1
     fi
 
     # The Drive API can surface versions even with no local source at all, so
@@ -292,11 +290,15 @@ list_versions() {
         done < <(find "$src" -maxdepth 1 -mindepth 1 -type d | tr '\n' '\0')
     done
 
-    # Drive API fallback (last resort): with no Drive mount, surface versions
-    # that exist on Drive but aren't staged locally. Buffered like any other
-    # entry (kind "api", root "API::<label>") so they sort in by version;
-    # the actual download happens on demand only if one is selected.
-    if (( ! DRIVE_MOUNT_OK )) && drive_api_available; then
+    # Drive API fallback (last resort): surface versions that exist on Drive but
+    # aren't visible locally. This runs even with a mount present, because Drive
+    # for Desktop routinely leaves the folder materialised-but-empty (the path
+    # exists but find sees nothing inside) — which would otherwise hide
+    # brand-new builds. Anything already found locally is dropped
+    # by the _seen dedup, so the API only ADDS missing versions. Buffered like
+    # any other entry (kind "api", root "API::<label>") so they sort in by
+    # version; the download happens on demand only if one is selected.
+    if drive_api_available; then
         echo "  checking Drive for more versions..."
         local lbl win dar
         while IFS=$'\t' read -r lbl win dar; do
