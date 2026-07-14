@@ -54,6 +54,18 @@ Versions just pulled by the sync step are staged under
 freshly-synced build is usable immediately even when Google Drive for Desktop
 isn't mounted (or hasn't surfaced the file yet).
 
+**Resolving a build follows three lines of defence, cheapest first:**
+
+1. **Local cache** — an already-extracted build in `.drive-cache\`, or a zip
+   staged in `.drive-cache\incoming\` (extracted on demand).
+2. **Drive mount** — the Google Drive for Desktop mount, when present.
+3. **Drive API** — as a last resort, when there's *no* mount, the switcher
+   lists every version in the Deliverables folder over the Drive API (tagged
+   `(Drive)` in the menu) and downloads the selected build straight into
+   `.drive-cache\incoming\` on demand. This needs the same OAuth setup as the
+   sync step; if it's unavailable (offline / no creds) the switcher silently
+   falls back to whatever is staged locally.
+
 ### macOS
 
 Run `switch-version.sh` (or double-click `USD IO Switcher.app`). The

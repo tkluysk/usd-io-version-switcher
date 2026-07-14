@@ -15,6 +15,7 @@ $PackagesDir    = Join-Path $ScriptDir 'packages'
 
 $script:BuildsDir       = ''
 $script:DriveBuildsDir  = ''
+$script:DriveMountOk    = $false  # a live Drive for Desktop mount was found
 $script:SourceMode      = ''   # 'local' or 'drive'
 $script:SketchUpTargets = @()
 $script:Versions        = @()
@@ -68,6 +69,65 @@ function Resolve-Python {
     return $null
 }
 
+# ── Drive API fallback ─────────────────────────────────────────────────────────
+# Last resort, used only when there is no Drive mount and a build isn't already
+# staged locally: sync-releases.py lists and downloads builds straight from the
+# Deliverables folder over the Drive API.
+
+function Test-DriveApiAvailable {
+    if (-not (Test-Path (Join-Path $ScriptDir 'sync-releases.py'))) { return $false }
+    return [bool](Resolve-Python)
+}
+
+# Ordered list of [pscustomobject]@{ Label; Win; Darwin } for every version in
+# the Deliverables folder, or @() on any failure (offline, no creds, ...).
+function Get-DriveApiVersions {
+    $py = Resolve-Python
+    if (-not $py) { return @() }
+    $syncScript = Join-Path $ScriptDir 'sync-releases.py'
+    try {
+        $lines = & $py $syncScript --list-deliverables 2>$null
+        if ($LASTEXITCODE -ne 0) { return @() }
+    } catch { return @() }
+
+    $out = @()
+    foreach ($line in $lines) {
+        if (-not $line) { continue }
+        $parts = $line -split "`t"
+        if ($parts.Count -lt 3) { continue }
+        $out += [pscustomobject]@{
+            Label  = $parts[0]
+            Win    = if ($parts[1] -eq '-') { $null } else { $parts[1] }
+            Darwin = if ($parts[2] -eq '-') { $null } else { $parts[2] }
+        }
+    }
+    return $out
+}
+
+# Download a version's platform ('win64'|'Darwin') Release zip into
+# .drive-cache\incoming\<label>\ via the Drive API. Returns that folder on
+# success (ready for Resolve-WindowsRoot / packaging), $null on failure.
+function Invoke-DriveApiDownload([string]$label, [string]$platform) {
+    $py = Resolve-Python
+    if (-not $py) { return $null }
+    $syncScript = Join-Path $ScriptDir 'sync-releases.py'
+    $dest = Join-Path $IncomingDir $label
+    Write-Host "  downloading $label ($platform) from Drive..." -ForegroundColor DarkGray
+    try {
+        # Pipe the child's output to the host so it stays off this function's
+        # pipeline — otherwise its stdout would pollute the returned path.
+        & $py $syncScript --download $label $platform $dest 2>&1 | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "  (Drive download failed for $label / $platform)" -ForegroundColor Yellow
+            return $null
+        }
+    } catch {
+        Write-Host "  (Drive download failed for $label / $platform)" -ForegroundColor Yellow
+        return $null
+    }
+    return $dest
+}
+
 # Optionally pull new SkpXyz releases from the GitLab wiki into Drive so the
 # version list below is up to date. Never aborts the switcher on failure.
 function Invoke-MaybeSync {
@@ -96,6 +156,7 @@ function Select-Source {
     $localOk = Test-Path $LocalBuildsDir -PathType Container
     $script:DriveBuildsDir = Find-DriveBuildsDir
     $mountOk = [bool]$script:DriveBuildsDir
+    $script:DriveMountOk = $mountOk
     # Freshly-synced Release zips staged by sync-releases.py under
     # .drive-cache\incoming let drive mode work even when Drive for Desktop
     # hasn't surfaced them yet — or isn't mounted on this machine at all.
@@ -259,6 +320,24 @@ function Get-Versions {
             $script:Versions     += $label
             $script:VersionRoots += $winDir.FullName
             Write-Host "  $idx) $label"
+            $idx++
+        }
+    }
+
+    # Drive API fallback (last resort): with no mount, surface versions that
+    # exist on Drive but aren't staged locally. Their root is an "API::<label>"
+    # sentinel, downloaded on demand only if selected.
+    if ($script:SourceMode -eq 'drive' -and -not $script:DriveMountOk -and (Test-DriveApiAvailable)) {
+        Write-Host "  checking Drive for more versions..." -ForegroundColor DarkGray
+        $apiVersions = Get-DriveApiVersions |
+                       Sort-Object { [version]($_.Label -replace '^.*?(\d+\.\d+(\.\d+)*).*$','$1') } -Descending -ErrorAction SilentlyContinue
+        foreach ($v in $apiVersions) {
+            if ($seen.ContainsKey($v.Label)) { continue }
+            if (-not $v.Win) { continue }   # need a Windows build to install here
+            $script:Versions     += $v.Label
+            $script:VersionRoots += "API::$($v.Label)"
+            Write-Host "  $idx) $($v.Label)  (Drive)"
+            $seen[$v.Label] = $true
             $idx++
         }
     }
@@ -552,13 +631,19 @@ function Invoke-GeneratePackages([string]$label, [string]$versionRoot) {
     New-Item -ItemType Directory -Force $PackagesDir | Out-Null
 
     $platforms = @(
-        @{ Name = 'Windows'; ZipPat = '*win64-Release*.zip';  DirPat = '*win64-Release*' },
-        @{ Name = 'macOS';   ZipPat = '*Darwin-Release*.zip'; DirPat = '*Darwin-Release*' }
+        @{ Name = 'Windows'; ZipPat = '*win64-Release*.zip';  DirPat = '*win64-Release*';  ApiPlat = 'win64'  },
+        @{ Name = 'macOS';   ZipPat = '*Darwin-Release*.zip'; DirPat = '*Darwin-Release*'; ApiPlat = 'Darwin' }
     )
 
     $made = @()
     foreach ($p in $platforms) {
         $srcZip = Get-ChildItem $verFolder -File -Filter $p.ZipPat -ErrorAction SilentlyContinue | Select-Object -First 1
+        # Drive API fallback: a platform zip missing locally (e.g. an API-only
+        # version fetched for the other platform's install) is downloaded now.
+        if (-not $srcZip -and $script:SourceMode -eq 'drive' -and (Test-DriveApiAvailable)) {
+            $dl = Invoke-DriveApiDownload (Split-Path -Leaf $verFolder) $p.ApiPlat
+            if ($dl) { $srcZip = Get-ChildItem $dl -File -Filter $p.ZipPat -ErrorAction SilentlyContinue | Select-Object -First 1 }
+        }
         if ($srcZip) {
             $top    = [System.IO.Path]::GetFileNameWithoutExtension($srcZip.Name) + '-plugin-only'
             $outZip = Join-Path $PackagesDir ($top + '.zip')
@@ -658,6 +743,17 @@ if ($choice -notmatch '^\d+$' -or [int]$choice -lt 1 -or [int]$choice -gt $scrip
     Die "Invalid selection: $choice"
 }
 $idx = [int]$choice - 1
+
+# Resolve a Drive-API-only selection to a locally staged folder once, up front,
+# so both the install loop and packaging reuse the same download.
+if ($script:VersionRoots[$idx] -like 'API::*') {
+    $apiLabel = $script:VersionRoots[$idx].Substring(5)
+    Write-Host ""
+    Write-Host "Fetching $apiLabel from Drive (no local copy found)..."
+    $dl = Invoke-DriveApiDownload $apiLabel 'win64'
+    if (-not $dl) { Die "Could not download $apiLabel from Drive." }
+    $script:VersionRoots[$idx] = $dl
+}
 
 foreach ($sketchupDir in $script:SketchUpTargets) {
     $dirs = Get-ExporterImporterDirs $sketchupDir

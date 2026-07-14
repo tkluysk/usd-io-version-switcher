@@ -313,6 +313,66 @@ def upload_plugins(paths: list[Path]) -> None:
         print(f"[upload] done: {path.name}")
 
 
+def _is_release_zip(name: str, platform: str) -> bool:
+    return (name.endswith(".zip") and platform in name
+            and "Release" in name and "Debug" not in name)
+
+
+def list_deliverables() -> None:
+    """Print one tab-separated line per version folder that holds at least one
+    Release zip:  <label>\\t<win64_zip|-->\\t<darwin_zip|-->. Consumed by the
+    switcher's Drive-API fallback to enumerate versions with no local copy."""
+    service = _gdrive_service()
+    for item in _list_folder(service, DELIVERABLES_FOLDER_ID):
+        if item["mimeType"] != "application/vnd.google-apps.folder":
+            continue
+        win = dar = "-"
+        for child in _list_folder(service, item["id"]):
+            if _is_release_zip(child["name"], "win64"):
+                win = child["name"]
+            elif _is_release_zip(child["name"], "Darwin"):
+                dar = child["name"]
+        if win != "-" or dar != "-":
+            print(f"{item['name']}\t{win}\t{dar}")
+
+
+def download_deliverable(label: str, platform: str, destdir: str) -> None:
+    """Download the <platform> ('win64'|'Darwin') Release zip for version folder
+    <label> into <destdir>. Prints the saved path as the final stdout line."""
+    from googleapiclient.http import MediaIoBaseDownload
+
+    service = _gdrive_service()
+    folder_id = None
+    for item in _list_folder(service, DELIVERABLES_FOLDER_ID):
+        if item["name"] == label and item["mimeType"] == "application/vnd.google-apps.folder":
+            folder_id = item["id"]
+            break
+    if not folder_id:
+        print(f"[download] version folder not found: {label}", file=sys.stderr)
+        sys.exit(2)
+
+    target = next((c for c in _list_folder(service, folder_id)
+                   if _is_release_zip(c["name"], platform)), None)
+    if not target:
+        print(f"[download] no {platform} Release zip in {label}", file=sys.stderr)
+        sys.exit(3)
+
+    dest_dir = Path(destdir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / target["name"]
+
+    req = service.files().get_media(fileId=target["id"], supportsAllDrives=True)
+    with io.FileIO(str(dest), "wb") as buf:
+        downloader = MediaIoBaseDownload(buf, req, chunksize=8 * 1024 * 1024)
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+            if status:
+                print(f"\r  {int(status.progress() * 100)}%", end="", flush=True)
+    print()
+    print(str(dest))
+
+
 def _stage_locally(version_folder: str, zip_name: str, data: bytes) -> None:
     """Mirror a just-uploaded zip into <repo>/.drive-cache/incoming/ so the
     switcher can install it immediately, without waiting for Drive for
@@ -450,6 +510,12 @@ def main():
     ap.add_argument("--upload-plugin", metavar="ZIP", nargs="+",
                     help="Upload generated plugin-only zip(s) to their per-version "
                          "Deliverables subfolder, then exit.")
+    ap.add_argument("--list-deliverables", action="store_true",
+                    help="Print versions available in the Deliverables folder "
+                         "(tab-separated: label, win64 zip, Darwin zip), then exit.")
+    ap.add_argument("--download", nargs=3, metavar=("LABEL", "PLATFORM", "DESTDIR"),
+                    help="Download the PLATFORM (win64|Darwin) Release zip for "
+                         "version LABEL into DESTDIR, then exit.")
     args = ap.parse_args()
 
     if args.auth:
@@ -464,6 +530,28 @@ def main():
             sys.exit(1)
         except RuntimeError as e:
             print(f"[upload] {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    if args.list_deliverables:
+        try:
+            list_deliverables()
+        except ImportError:
+            print("[list] Google client libraries not installed.", file=sys.stderr)
+            sys.exit(1)
+        except RuntimeError as e:
+            print(f"[list] {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    if args.download:
+        try:
+            download_deliverable(*args.download)
+        except ImportError:
+            print("[download] Google client libraries not installed.", file=sys.stderr)
+            sys.exit(1)
+        except RuntimeError as e:
+            print(f"[download] {e}", file=sys.stderr)
             sys.exit(1)
         return
 

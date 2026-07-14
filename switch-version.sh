@@ -15,7 +15,8 @@ PACKAGES_DIR="$SCRIPT_DIR/packages"
 MADE_PKGS=()  # plugin-only zips produced by generate_packages, for upload
 
 BUILDS_DIR=""
-SOURCE_MODE=""  # "local" or "drive"
+SOURCE_MODE=""     # "local" or "drive"
+DRIVE_MOUNT_OK=0   # a live Drive for Desktop mount was found
 
 SKETCHUP_APPS=()
 SKETCHUP_TARGETS=()
@@ -59,6 +60,40 @@ find_python() {
         echo python; return 0
     fi
     return 1
+}
+
+# ── Drive API fallback ─────────────────────────────────────────────────────────
+# Last resort, used only when there is no Drive mount and a build isn't already
+# staged locally: sync-releases.py lists and downloads builds straight from the
+# Deliverables folder over the Drive API.
+
+drive_api_available() {
+    [[ -f "$SCRIPT_DIR/sync-releases.py" ]] || return 1
+    find_python >/dev/null 2>&1 || return 1
+    return 0
+}
+
+# Echo raw "label<TAB>win64_zip<TAB>darwin_zip" lines for every Deliverables
+# version, or return non-zero on failure (offline, no creds, ...).
+get_drive_api_versions() {
+    local py
+    py=$(find_python) || return 1
+    "$py" "$SCRIPT_DIR/sync-releases.py" --list-deliverables 2>/dev/null || return 1
+}
+
+# Download a version's platform ('win64'|'Darwin') Release zip into
+# .drive-cache/incoming/<label>/. Echoes that folder on success (progress goes
+# to stderr so it stays off stdout), returns non-zero on failure.
+drive_api_download() {
+    local label="$1" platform="$2" py dest
+    py=$(find_python) || return 1
+    dest="$INCOMING_DIR/$label"
+    echo "  downloading $label ($platform) from Drive..." >&2
+    if ! "$py" "$SCRIPT_DIR/sync-releases.py" --download "$label" "$platform" "$dest" >&2; then
+        echo "  (Drive download failed for $label / $platform)" >&2
+        return 1
+    fi
+    echo "$dest"
 }
 
 # Optionally pull new SkpXyz releases from the GitLab wiki into Drive so the
@@ -131,6 +166,7 @@ pick_source() {
     [[ -d "$LOCAL_BUILDS_DIR" ]] && local_ok=1
     DRIVE_BUILDS_DIR="$(find_drive_builds_dir || true)"
     [[ -n "$DRIVE_BUILDS_DIR" ]] && mount_ok=1
+    DRIVE_MOUNT_OK=$mount_ok
     # Freshly-synced Release zips staged by sync-releases.py under
     # .drive-cache/incoming let drive mode work even when Drive for Desktop
     # hasn't surfaced them yet — or isn't mounted on this machine at all.
@@ -274,6 +310,24 @@ list_versions() {
             ((idx++))
         fi
     done < <(find "$BUILDS_DIR" -maxdepth 1 -mindepth 1 -type d | sort -Vr | tr '\n' '\0')
+
+    # Drive API fallback (last resort): with no mount, surface versions that
+    # exist on Drive but aren't staged locally. Their root is an "API::<label>"
+    # sentinel, downloaded on demand only if selected.
+    if [[ "$SOURCE_MODE" == "drive" && $DRIVE_MOUNT_OK -eq 0 ]] && drive_api_available; then
+        echo "  checking Drive for more versions..."
+        local lbl win dar
+        while IFS=$'\t' read -r lbl win dar; do
+            [[ -z "$lbl" ]] && continue
+            case "$seen" in *"|$lbl|"*) continue ;; esac
+            [[ "$dar" == "-" ]] && continue   # need a macOS build to install here
+            VERSIONS+=("$lbl")
+            VERSION_ROOTS+=("API::$lbl")
+            echo "  $idx) $lbl  (Drive)"
+            seen="$seen|$lbl|"
+            ((idx++))
+        done < <(get_drive_api_versions | sort -Vr)
+    fi
 }
 
 current_version() {
@@ -543,16 +597,24 @@ generate_packages() {
     mkdir -p "$PACKAGES_DIR"
     PKG_TMP_DIRS=()
     MADE_PKGS=()
-    local made=0 spec pname dpat zpat root top out kept t
+    local made=0 spec pname dpat zpat apiplat root top out kept t dl
 
-    # name | extracted-dir glob | release-zip glob
+    # name | extracted-dir glob | release-zip glob | Drive-API platform token
     local specs=(
-        "Windows|*win64-Release*|*win64-Release*.zip"
-        "macOS|*Darwin-Release*|*Darwin-Release*.zip"
+        "Windows|*win64-Release*|*win64-Release*.zip|win64"
+        "macOS|*Darwin-Release*|*Darwin-Release*.zip|Darwin"
     )
     for spec in "${specs[@]}"; do
-        IFS='|' read -r pname dpat zpat <<<"$spec"
-        if ! root=$(get_platform_root "$folder" "$dpat" "$zpat"); then
+        IFS='|' read -r pname dpat zpat apiplat <<<"$spec"
+        root=$(get_platform_root "$folder" "$dpat" "$zpat") || root=""
+        # Drive API fallback: a platform missing locally (e.g. an API-only
+        # version fetched for the other platform's install) is downloaded now.
+        if [[ -z "$root" && "$SOURCE_MODE" == "drive" ]] && drive_api_available; then
+            if dl=$(drive_api_download "$(basename "$folder")" "$apiplat"); then
+                root=$(get_platform_root "$dl" "$dpat" "$zpat") || root=""
+            fi
+        fi
+        if [[ -z "$root" ]]; then
             echo "  ($pname: no source found — skipped)"
             continue
         fi
@@ -646,6 +708,18 @@ if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#VERSIONS[@]} ))
 fi
 
 idx=$(( choice - 1 ))
+
+# Resolve a Drive-API-only selection to a locally staged folder once, up front,
+# so both the install loop and packaging reuse the same download.
+if [[ "${VERSION_ROOTS[$idx]}" == API::* ]]; then
+    api_label="${VERSION_ROOTS[$idx]#API::}"
+    echo ""
+    echo "Fetching $api_label from Drive (no local copy found)..."
+    if ! dl=$(drive_api_download "$api_label" "Darwin"); then
+        die "Could not download $api_label from Drive."
+    fi
+    VERSION_ROOTS[$idx]="$dl"
+fi
 
 for SKETCHUP_APP in "${SKETCHUP_TARGETS[@]}"; do
     PLUGINS_DIR="$SKETCHUP_APP/Contents/PlugIns"
