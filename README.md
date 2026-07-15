@@ -33,9 +33,10 @@ result → Pin to taskbar.
 
 To run the switcher: click the Start Menu / taskbar entry (or
 double-click `Launch Switcher.bat` for the same effect). Approve the UAC
-prompt. Pick a source (local `builds/` or Google Drive), a SketchUp
-install, and a version. The script removes the previously installed
-plugin files first, then copies the new ones.
+prompt, pick a SketchUp install and a version. There's no source to choose —
+the switcher merges every available source (see below) into one deduplicated,
+newest-first version list. The script removes the previously installed plugin
+files first, then copies the new ones.
 
 The switcher auto-detects:
 
@@ -50,21 +51,26 @@ When sourcing from Drive, zips are extracted on demand to `.drive-cache\`
 inside the repo.
 
 Versions just pulled by the sync step are staged under
-`.drive-cache\incoming\` and count as a Drive source on their own — so a
+`.drive-cache\incoming\` and count as a source on their own — so a
 freshly-synced build is usable immediately even when Google Drive for Desktop
 isn't mounted (or hasn't surfaced the file yet).
 
-**Resolving a build follows three lines of defence, cheapest first:**
+**The version list is the union of every available source, deduped by version
+(a `.drive-cache\incoming\` copy shadows an older one on the slow mount) and
+sorted newest-first.** Resolving the *selected* build then follows three lines
+of defence, cheapest first:
 
 1. **Local cache** — an already-extracted build in `.drive-cache\`, or a zip
    staged in `.drive-cache\incoming\` (extracted on demand).
 2. **Drive mount** — the Google Drive for Desktop mount, when present.
-3. **Drive API** — as a last resort, when there's *no* mount, the switcher
-   lists every version in the Deliverables folder over the Drive API (tagged
-   `(Drive)` in the menu) and downloads the selected build straight into
-   `.drive-cache\incoming\` on demand. This needs the same OAuth setup as the
-   sync step; if it's unavailable (offline / no creds) the switcher silently
-   falls back to whatever is staged locally.
+3. **Drive API** — versions on Drive that aren't visible locally are listed
+   over the Drive API (tagged `(Drive)` in the menu) and the selected one is
+   downloaded straight into `.drive-cache\incoming\` on demand. The API is
+   consulted *even when the mount is present*, because Drive for Desktop
+   routinely leaves a folder present-but-empty and would otherwise hide
+   brand-new builds. It needs the same OAuth setup as the sync step; if it's
+   unavailable (offline / no creds) the switcher silently uses whatever is
+   local.
 
 ### macOS
 

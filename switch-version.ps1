@@ -13,13 +13,16 @@ $SketchUpRoot   = 'C:\Program Files\SketchUp'
 # Output folder for generated plugin-only zip packages (gitignored).
 $PackagesDir    = Join-Path $ScriptDir 'packages'
 
-$script:BuildsDir       = ''
-$script:DriveBuildsDir  = ''
-$script:DriveMountOk    = $false  # a live Drive for Desktop mount was found
-$script:SourceMode      = ''   # 'local' or 'drive'
+$script:DriveBuildsDir  = ''   # Drive for Desktop mount path, if found (cache-key use)
+# Build-source roots in priority order (most-local first); kinds are parallel:
+# 'dir' = folders hold an already-extracted *win64-Release* root; 'zip' = folders
+# hold a *win64-Release*.zip to extract on demand into .drive-cache\.
+$script:SourceDirs      = @()
+$script:SourceKinds     = @()
 $script:SketchUpTargets = @()
 $script:Versions        = @()
 $script:VersionRoots    = @()
+$script:VersionKinds    = @()  # 'dir' | 'zip' | 'api', parallel to Versions
 $script:ExportersDir    = ''
 $script:ImportersDir    = ''
 
@@ -152,42 +155,27 @@ function Invoke-MaybeSync {
     }
 }
 
-function Select-Source {
-    $localOk = Test-Path $LocalBuildsDir -PathType Container
+# Gather every place a build might live, in priority order (newest/most-local
+# first): freshly-synced staging, the checked-in builds\ folder, then the live
+# Drive mount as a fallback. Get-Versions dedups by label across all of them, so
+# there's no source to pick — the union is the source. Get-Versions also
+# consults the Drive API as a last resort for versions not visible locally.
+function Find-BuildSources {
+    if (Test-Path $IncomingDir -PathType Container) {
+        $script:SourceDirs += $IncomingDir;      $script:SourceKinds += 'zip'
+    }
+    if (Test-Path $LocalBuildsDir -PathType Container) {
+        $script:SourceDirs += $LocalBuildsDir;   $script:SourceKinds += 'dir'
+    }
     $script:DriveBuildsDir = Find-DriveBuildsDir
-    $mountOk = [bool]$script:DriveBuildsDir
-    $script:DriveMountOk = $mountOk
-    # Freshly-synced Release zips staged by sync-releases.py under
-    # .drive-cache\incoming let drive mode work even when Drive for Desktop
-    # hasn't surfaced them yet — or isn't mounted on this machine at all.
-    $incomingOk = (Test-Path $IncomingDir) -and
-                  [bool](Get-ChildItem $IncomingDir -Directory -ErrorAction SilentlyContinue | Select-Object -First 1)
-    $driveOk = $mountOk -or $incomingOk
-
-    # In drive mode, enumerate from the Drive mount when present, else fall back
-    # to the local staging dir (its subfolders are listed the same way).
-    $driveDir   = if ($mountOk) { $script:DriveBuildsDir } else { $IncomingDir }
-    $driveLabel = if ($mountOk) { $script:DriveBuildsDir } else { "staged downloads ($IncomingDir)" }
-
-    if ($localOk -and -not $driveOk) {
-        $script:SourceMode = 'local'; $script:BuildsDir = $LocalBuildsDir; return
-    }
-    if ($driveOk -and -not $localOk) {
-        $script:SourceMode = 'drive'; $script:BuildsDir = $driveDir; return
-    }
-    if (-not $localOk -and -not $driveOk) {
-        Die "No sources found: local builds dir ($LocalBuildsDir), a Google Drive mount with '$DriveRelPath', or staged downloads in $IncomingDir."
+    if ($script:DriveBuildsDir) {
+        $script:SourceDirs += $script:DriveBuildsDir; $script:SourceKinds += 'zip'
     }
 
-    Write-Host "Select source:"
-    Write-Host "  1) Local builds folder ($LocalBuildsDir)"
-    Write-Host "  2) Google Drive ($driveLabel)"
-    Write-Host ""
-    $choice = Read-Host "Select source [1-2]"
-    switch ($choice) {
-        '1' { $script:SourceMode = 'local'; $script:BuildsDir = $LocalBuildsDir }
-        '2' { $script:SourceMode = 'drive'; $script:BuildsDir = $driveDir }
-        default { Die "Invalid selection: $choice" }
+    # The Drive API can surface versions even with no local source at all, so
+    # don't die yet if it's available — Get-Versions will try it.
+    if ($script:SourceDirs.Count -eq 0 -and -not (Test-DriveApiAvailable)) {
+        Die "No build sources found (looked in $LocalBuildsDir, $IncomingDir, and Google Drive)."
     }
 }
 
@@ -222,124 +210,132 @@ function Select-SketchUp {
     }
 }
 
-# Finds or extracts a win64-Release root dir for a given version folder.
-# Returns the path on success, $null on failure.
+# Returns a win64-Release root dir for the given version folder. If the folder
+# already holds an extracted *win64-Release* root, that's returned as-is;
+# otherwise a *win64-Release*.zip is extracted on demand into .drive-cache\.
 function Resolve-WindowsRoot([string]$dir) {
     $winDir = Get-ChildItem $dir -Directory -Filter '*win64-Release*' -ErrorAction SilentlyContinue |
               Select-Object -First 1
     if ($winDir) { return $winDir.FullName }
 
-    if ($script:SourceMode -eq 'drive') {
-        $zip = Get-ChildItem $dir -File -Filter '*win64-Release*.zip' -ErrorAction SilentlyContinue |
-               Select-Object -First 1
-        if (-not $zip) { return $null }
+    $zip = Get-ChildItem $dir -File -Filter '*win64-Release*.zip' -ErrorAction SilentlyContinue |
+           Select-Object -First 1
+    if (-not $zip) { return $null }
 
-        # Use the dir path relative to its source root as a stable cache key.
-        # Staged dirs live under $IncomingDir; Drive-mount dirs under $script:BuildsDir.
-        if ($dir.StartsWith($IncomingDir, [StringComparison]::OrdinalIgnoreCase)) {
-            $label = $dir.Substring($IncomingDir.Length).TrimStart('\')
-        } else {
-            $label = $dir.Substring($script:BuildsDir.Length).TrimStart('\')
-        }
-        $cache = Join-Path $DriveCacheDir ($label -replace '\\', '__')
+    # Use the dir path relative to its source root as a stable cache key.
+    # Staged dirs live under $IncomingDir; Drive-mount dirs under $script:DriveBuildsDir.
+    if ($dir.StartsWith($IncomingDir, [StringComparison]::OrdinalIgnoreCase)) {
+        $label = $dir.Substring($IncomingDir.Length).TrimStart('\')
+    } elseif ($script:DriveBuildsDir -and $dir.StartsWith($script:DriveBuildsDir, [StringComparison]::OrdinalIgnoreCase)) {
+        $label = $dir.Substring($script:DriveBuildsDir.Length).TrimStart('\')
+    } else {
+        $label = Split-Path -Leaf $dir
+    }
+    $cache = Join-Path $DriveCacheDir ($label -replace '\\', '__')
+    $winDir = Get-ChildItem $cache -Directory -Filter '*win64-Release*' -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+    if (-not $winDir) {
+        New-Item -ItemType Directory -Force $cache | Out-Null
+        Write-Host "  extracting $($zip.Name) -> .drive-cache\$label\" -ForegroundColor DarkGray
+        Expand-Archive -Path $zip.FullName -DestinationPath $cache -Force
         $winDir = Get-ChildItem $cache -Directory -Filter '*win64-Release*' -ErrorAction SilentlyContinue |
                   Select-Object -First 1
-        if (-not $winDir) {
-            New-Item -ItemType Directory -Force $cache | Out-Null
-            Write-Host "  extracting $($zip.Name) -> .drive-cache\$label\" -ForegroundColor DarkGray
-            Expand-Archive -Path $zip.FullName -DestinationPath $cache -Force
-            $winDir = Get-ChildItem $cache -Directory -Filter '*win64-Release*' -ErrorAction SilentlyContinue |
-                      Select-Object -First 1
-        }
-        if ($winDir) { return $winDir.FullName }
     }
+    if ($winDir) { return $winDir.FullName }
     return $null
 }
 
+# True if a folder directly contains an extracted *win64-Release* root or a
+# *win64-Release*.zip — i.e. it's an installable version folder.
 function Test-HasWindowsBuild([string]$dir) {
     $hasDir = [bool](Get-ChildItem $dir -Directory -Filter '*win64-Release*' -ErrorAction SilentlyContinue | Select-Object -First 1)
     $hasZip = [bool](Get-ChildItem $dir -File    -Filter '*win64-Release*.zip' -ErrorAction SilentlyContinue | Select-Object -First 1)
     return $hasDir -or $hasZip
 }
 
-function Get-Versions {
-    $idx  = 1
-    $seen = @{}
+function Test-PreRelease([string]$label) {
+    return ($label -match '\s0\.[0-3]\.' -or $label -match '\s0\.[0-3]$')
+}
 
-    # Pre-pass: list staged versions (newly-synced zips that Drive for Desktop
-    # may not have surfaced on the local mount yet). Drive mode only.
-    if ($script:SourceMode -eq 'drive' -and (Test-Path $IncomingDir)) {
-        $stagedDirs = Get-ChildItem $IncomingDir -Directory |
-                      Sort-Object { [version]($_.Name -replace '^.*?(\d+\.\d+(\.\d+)*).*$','$1') } -Descending -ErrorAction SilentlyContinue
-        foreach ($dir in $stagedDirs) {
-            $label = $dir.Name
-            if (Test-HasWindowsBuild $dir.FullName) {
-                $script:Versions     += $label
-                $script:VersionRoots += $dir.FullName
-                Write-Host "  $idx) $label"
-                $seen[$label] = $true
-                $idx++
-            }
-        }
+# Record one installable entry into $pending (an ArrayList) unless a
+# higher-priority source already claimed its label. For 'dir' sources the root
+# is the extracted win64 dir; for 'zip' sources it's the version folder itself
+# (extracted on demand later). $pending and $seen are objects, so mutations here
+# persist in the caller.
+function Add-PendingVersion($pending, $seen, [string]$label, [string]$dir, [string]$srcKind) {
+    if ($seen.ContainsKey($label)) { return }
+    if ($srcKind -eq 'dir') {
+        $root = Get-ChildItem $dir -Directory -Filter '*win64-Release*' -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+        if (-not $root) { return }
+        $root = $root.FullName
+    } else {
+        $root = $dir
     }
+    [void]$pending.Add([pscustomobject]@{ Label = $label; Kind = $srcKind; Root = $root })
+    $seen[$label] = $true
+}
 
-    $dirs = Get-ChildItem $script:BuildsDir -Directory |
-            Sort-Object { [version]($_.Name -replace '^.*?(\d+\.\d+(\.\d+)*).*$','$1') } -Descending -ErrorAction SilentlyContinue
+# Build a single deduplicated version list across every source in SourceDirs,
+# then sort it strictly newest-first regardless of source. On a duplicate label
+# the first (highest-priority) source wins — so a freshly-synced build in
+# incoming\ shadows an older copy on the slow Drive mount — but the final list
+# is ordered purely by version. The Drive API is consulted last and only ADDS
+# versions not already found locally.
+function Get-Versions {
+    $seen    = @{}
+    $pending = [System.Collections.ArrayList]::new()
 
-    foreach ($dir in $dirs) {
-        $label = $dir.Name
-        # Already added from the staging pre-pass — don't list again.
-        if ($seen.ContainsKey($label)) { continue }
-        # Skip pre-0.4.0
-        if ($label -match '\s0\.[0-3]\.' -or $label -match '\s0\.[0-3]$') { continue }
+    for ($i = 0; $i -lt $script:SourceDirs.Count; $i++) {
+        $src     = $script:SourceDirs[$i]
+        $srcKind = $script:SourceKinds[$i]
+        if (-not (Test-Path $src -PathType Container)) { continue }
 
-        if ($script:SourceMode -eq 'drive') {
-            $added = $false
+        foreach ($dir in (Get-ChildItem $src -Directory -ErrorAction SilentlyContinue)) {
+            $label = $dir.Name
+            if (Test-PreRelease $label) { continue }
             if (Test-HasWindowsBuild $dir.FullName) {
-                $script:Versions     += $label
-                $script:VersionRoots += $dir.FullName
-                Write-Host "  $idx) $label"
-                $idx++; $added = $true
-            }
-            if (-not $added) {
-                $subs = Get-ChildItem $dir.FullName -Directory | Sort-Object Name
-                foreach ($sub in $subs) {
-                    $sublabel = "$label / $($sub.Name)"
+                Add-PendingVersion $pending $seen $label $dir.FullName $srcKind
+            } else {
+                # Descend one level for variant subfolders (e.g. "Using SketchUp libs").
+                foreach ($sub in (Get-ChildItem $dir.FullName -Directory -ErrorAction SilentlyContinue)) {
                     if (Test-HasWindowsBuild $sub.FullName) {
-                        $script:Versions     += $sublabel
-                        $script:VersionRoots += $sub.FullName
-                        Write-Host "  $idx) $sublabel"
-                        $idx++
+                        Add-PendingVersion $pending $seen "$label / $($sub.Name)" $sub.FullName $srcKind
                     }
                 }
             }
-        } else {
-            $winDir = Get-ChildItem $dir.FullName -Directory -Filter '*win64-Release*' -ErrorAction SilentlyContinue |
-                      Select-Object -First 1
-            if (-not $winDir) { continue }
-            $script:Versions     += $label
-            $script:VersionRoots += $winDir.FullName
-            Write-Host "  $idx) $label"
-            $idx++
         }
     }
 
-    # Drive API fallback (last resort): with no mount, surface versions that
-    # exist on Drive but aren't staged locally. Their root is an "API::<label>"
-    # sentinel, downloaded on demand only if selected.
-    if ($script:SourceMode -eq 'drive' -and -not $script:DriveMountOk -and (Test-DriveApiAvailable)) {
+    # Drive API fallback (last resort): surface versions that exist on Drive but
+    # aren't visible locally. This runs even with a mount present, because Drive
+    # for Desktop routinely leaves the folder materialised-but-empty (the path
+    # exists but enumeration sees nothing inside), which would otherwise hide
+    # brand-new builds. The $seen dedup ensures the API only ADDS missing
+    # versions; each is an "API::<label>" sentinel, downloaded on demand only if
+    # selected.
+    if (Test-DriveApiAvailable) {
         Write-Host "  checking Drive for more versions..." -ForegroundColor DarkGray
-        $apiVersions = Get-DriveApiVersions |
-                       Sort-Object { [version]($_.Label -replace '^.*?(\d+\.\d+(\.\d+)*).*$','$1') } -Descending -ErrorAction SilentlyContinue
-        foreach ($v in $apiVersions) {
+        foreach ($v in (Get-DriveApiVersions)) {
             if ($seen.ContainsKey($v.Label)) { continue }
-            if (-not $v.Win) { continue }   # need a Windows build to install here
-            $script:Versions     += $v.Label
-            $script:VersionRoots += "API::$($v.Label)"
-            Write-Host "  $idx) $($v.Label)  (Drive)"
+            if (-not $v.Win) { continue }          # need a Windows build to install here
+            if (Test-PreRelease $v.Label) { continue }
+            [void]$pending.Add([pscustomobject]@{ Label = $v.Label; Kind = 'api'; Root = "API::$($v.Label)" })
             $seen[$v.Label] = $true
-            $idx++
         }
+    }
+
+    # Sort the merged buffer newest-first by version, then publish + display.
+    $sorted = $pending |
+              Sort-Object { [version]($_.Label -replace '^.*?(\d+\.\d+(\.\d+)*).*$','$1') } -Descending -ErrorAction SilentlyContinue
+    $idx = 1
+    foreach ($v in $sorted) {
+        $script:Versions     += $v.Label
+        $script:VersionRoots += $v.Root
+        $script:VersionKinds += $v.Kind
+        if ($v.Kind -eq 'api') { Write-Host "  $idx) $($v.Label)  (Drive)" }
+        else                   { Write-Host "  $idx) $($v.Label)" }
+        $idx++
     }
 }
 
@@ -351,7 +347,9 @@ function Get-CurrentVersion {
 # ── removal ───────────────────────────────────────────────────────────────────
 
 function Shorten([string]$path) {
-    $path = $path -replace [regex]::Escape($script:BuildsDir + '\'), ''
+    foreach ($src in $script:SourceDirs) {
+        $path = $path -replace [regex]::Escape($src + '\'), ''
+    }
     $path = $path -replace [regex]::Escape($DriveCacheDir   + '\'), '.drive-cache\'
     $path = $path -replace [regex]::Escape($env:USERPROFILE + '\'), '~\'
     if ($path -match '(SkpXyz-[^\\]+\\.+)') { $path = "...\$($Matches[1])" }
@@ -618,11 +616,11 @@ function New-PluginZipFromDir([string]$root, [string]$outZip, [string]$topName, 
 }
 
 # Generate plugin-only packages (both platforms) for the selected version.
-function Invoke-GeneratePackages([string]$label, [string]$versionRoot) {
-    # Find the folder that holds both platforms' sources. In drive mode the
-    # version root already is that folder; in local mode it is a single
-    # platform's extracted dir, so step up one level.
-    if ($script:SourceMode -eq 'drive') {
+function Invoke-GeneratePackages([string]$label, [string]$versionRoot, [string]$kind) {
+    # Find the folder that holds both platforms' sources. 'zip' entries point at
+    # the version folder (holds the platform zips); 'dir' entries point at the
+    # extracted win64 root, so step up one level.
+    if ($kind -eq 'zip') {
         $verFolder = $versionRoot
     } else {
         $verFolder = Split-Path -Parent $versionRoot
@@ -640,7 +638,7 @@ function Invoke-GeneratePackages([string]$label, [string]$versionRoot) {
         $srcZip = Get-ChildItem $verFolder -File -Filter $p.ZipPat -ErrorAction SilentlyContinue | Select-Object -First 1
         # Drive API fallback: a platform zip missing locally (e.g. an API-only
         # version fetched for the other platform's install) is downloaded now.
-        if (-not $srcZip -and $script:SourceMode -eq 'drive' -and (Test-DriveApiAvailable)) {
+        if (-not $srcZip -and (Test-DriveApiAvailable)) {
             $dl = Invoke-DriveApiDownload (Split-Path -Leaf $verFolder) $p.ApiPlat
             if ($dl) { $srcZip = Get-ChildItem $dl -File -Filter $p.ZipPat -ErrorAction SilentlyContinue | Select-Object -First 1 }
         }
@@ -705,13 +703,13 @@ function Invoke-MaybeUpload([string[]]$zips) {
     }
 }
 
-function Invoke-MaybePackage([string]$label, [string]$versionRoot) {
+function Invoke-MaybePackage([string]$label, [string]$versionRoot, [string]$kind) {
     Write-Host ""
     $ans = Read-Host "Also generate plugin-only zip package(s) for $label (Windows + macOS)? [y/N]"
     if ($ans -notmatch '^[Yy]$') { return }
     Write-Host ""
     Write-Host "Generating plugin-only packages (Converter excluded)..."
-    $made = Invoke-GeneratePackages $label $versionRoot
+    $made = Invoke-GeneratePackages $label $versionRoot $kind
     Invoke-MaybeUpload $made
 }
 
@@ -725,18 +723,17 @@ Write-Host ""
 Invoke-MaybeSync
 Write-Host ""
 
-Select-Source
-if (-not (Test-Path $script:BuildsDir)) { Die "Builds directory not found at: $script:BuildsDir" }
+Find-BuildSources
 
 Write-Host ""
 Select-SketchUp
 
 Write-Host ""
-Write-Host "Available versions (source: $($script:SourceMode)):"
+Write-Host "Available versions:"
 Get-Versions
 Write-Host ""
 
-if ($script:Versions.Count -eq 0) { Die "No build versions found in $script:BuildsDir" }
+if ($script:Versions.Count -eq 0) { Die "No build versions found." }
 
 $choice = Read-Host "Select version [1-$($script:Versions.Count)]"
 if ($choice -notmatch '^\d+$' -or [int]$choice -lt 1 -or [int]$choice -gt $script:Versions.Count) {
@@ -744,15 +741,25 @@ if ($choice -notmatch '^\d+$' -or [int]$choice -lt 1 -or [int]$choice -gt $scrip
 }
 $idx = [int]$choice - 1
 
-# Resolve a Drive-API-only selection to a locally staged folder once, up front,
-# so both the install loop and packaging reuse the same download.
-if ($script:VersionRoots[$idx] -like 'API::*') {
+# An 'api' selection has no local copy: download it into incoming\ first, which
+# turns it into an ordinary 'zip' entry pointing at the staged folder. Done once,
+# up front, so both the install loop and packaging reuse the same download.
+if ($script:VersionKinds[$idx] -eq 'api') {
     $apiLabel = $script:VersionRoots[$idx].Substring(5)
     Write-Host ""
     Write-Host "Fetching $apiLabel from Drive (no local copy found)..."
     $dl = Invoke-DriveApiDownload $apiLabel 'win64'
     if (-not $dl) { Die "Could not download $apiLabel from Drive." }
     $script:VersionRoots[$idx] = $dl
+    $script:VersionKinds[$idx] = 'zip'
+}
+
+# Resolve the win64 root once ('zip' entries extract on demand into .drive-cache\;
+# 'dir' entries already point at the extracted root).
+$winRoot = $script:VersionRoots[$idx]
+if ($script:VersionKinds[$idx] -eq 'zip') {
+    $winRoot = Resolve-WindowsRoot $winRoot
+    if (-not $winRoot) { Die "Could not extract Windows build for $($script:Versions[$idx])" }
 }
 
 foreach ($sketchupDir in $script:SketchUpTargets) {
@@ -765,15 +772,10 @@ foreach ($sketchupDir in $script:SketchUpTargets) {
     Write-Host ">>> $(Split-Path -Leaf $sketchupDir)"
     Write-Host "    Currently installed: $(Get-CurrentVersion)"
 
-    $root = $script:VersionRoots[$idx]
-    if ($script:SourceMode -eq 'drive') {
-        $root = Resolve-WindowsRoot $root
-        if (-not $root) { Die "Could not extract Windows build for $($script:Versions[$idx])" }
-    }
-    Install-Version $script:Versions[$idx] $root
+    Install-Version $script:Versions[$idx] $winRoot
 }
 
-Invoke-MaybePackage $script:Versions[$idx] $script:VersionRoots[$idx]
+Invoke-MaybePackage $script:Versions[$idx] $script:VersionRoots[$idx] $script:VersionKinds[$idx]
 
 Write-Host ""
 Read-Host "Press Enter to exit"
