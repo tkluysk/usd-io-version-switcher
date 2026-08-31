@@ -24,19 +24,36 @@ SOURCE_KINDS=()
 SKETCHUP_APPS=()
 SKETCHUP_TARGETS=()
 
+# True if $1 is a SketchUp application bundle. Identity comes from the bundle's
+# CFBundleIdentifier (com.sketchup.SketchUp.<year>), never from the folder or
+# app name: installers vary those freely (SketchUp.app, "SketchUp 26.2.app",
+# SketchUpPro-2027-0-258-13762/), and name matching silently missed installs.
+# This also excludes the LayOut.app that ships alongside every SketchUp.
+is_sketchup_app() {
+    local app="$1" bundle_id
+    [[ -d "$app/Contents" ]] || return 1
+    bundle_id=$(defaults read "$app/Contents/Info" CFBundleIdentifier 2>/dev/null) || return 1
+    [[ "$bundle_id" == com.sketchup.SketchUp.* ]]
+}
+
+# Bundle version (CFBundleShortVersionString), for disambiguating the menu when
+# several installs are all named SketchUp.app. Echoes nothing if unreadable.
+sketchup_app_version() {
+    defaults read "$1/Contents/Info" CFBundleShortVersionString 2>/dev/null || true
+}
+
 discover_sketchup_apps() {
     # Use if/then (not `[[ ]] && cmd`) — under bash 3.2 + `set -e`, a failing
     # `&&` compound at the top of a function aborts the script.
-    local dir app
-    # Nested layout (2026+): /Applications/SketchUp <year>/SketchUp.app
-    for dir in /Applications/SketchUp\ */; do
-        if [[ -d "${dir}SketchUp.app/Contents" ]]; then
-            SKETCHUP_APPS+=("${dir%/}/SketchUp.app")
-        fi
-    done
-    # Flat layout (older releases / dev builds): /Applications/SketchUp <ver>.app
-    for app in /Applications/SketchUp\ *.app; do
-        if [[ -d "$app/Contents" ]]; then
+    local app
+    # Scan /Applications and one level down, so both layouts are covered:
+    #   flat      /Applications/SketchUp 25.0.app
+    #   nested    /Applications/SketchUp 2026/SketchUp 26.2.app
+    #             /Applications/SketchUpPro-2027-0-258-13762/SketchUp.app
+    # Every .app is tested by bundle id rather than by name (see above), so
+    # unconventional installer layouts are picked up without new glob patterns.
+    for app in /Applications/*.app /Applications/*/*.app; do
+        if is_sketchup_app "$app"; then
             SKETCHUP_APPS+=("$app")
         fi
     done
@@ -134,9 +151,14 @@ pick_sketchup() {
     fi
 
     echo "Select SketchUp installation:"
-    local i=1
+    local i=1 ver
     for app in "${available[@]}"; do
-        echo "  $i) $app"
+        ver=$(sketchup_app_version "$app")
+        if [[ -n "$ver" ]]; then
+            echo "  $i) $app  (v$ver)"
+        else
+            echo "  $i) $app"
+        fi
         ((i++))
     done
     echo "  a) All of the above"
