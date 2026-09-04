@@ -381,7 +381,9 @@ shorten() {
 safe_rm() {
     local flag="$1"; shift
     for f in "$@"; do
-        if [[ -e "$f" ]]; then
+        # -L as well as -e: a symlink whose target was removed earlier in the
+        # same pass (the tbb SONAME links) is dangling and fails -e alone.
+        if [[ -e "$f" || -L "$f" ]]; then
             echo "  rm $(shorten "$f")"
             rm "$flag" "$f"
         fi
@@ -453,7 +455,9 @@ install_04x() {
     while IFS= read -r f; do
         id=$(otool -D "$f" 2>/dev/null | tail -n 1)
         id=${id##*/}
-        if [[ -n "$id" && "$id" != "$(basename "$f")" && ! -e "$FRAMEWORKS_DIR/$id" ]]; then
+        [[ -n "$id" && "$id" != "$(basename "$f")" ]] || continue
+        [[ -L "$FRAMEWORKS_DIR/$id" && ! -e "$FRAMEWORKS_DIR/$id" ]] && rm -f "$FRAMEWORKS_DIR/$id"
+        if [[ ! -e "$FRAMEWORKS_DIR/$id" ]]; then
             echo "  ln -s $(basename "$f") -> $(shorten "$FRAMEWORKS_DIR/$id")"
             ln -s "$(basename "$f")" "$FRAMEWORKS_DIR/$id"
         fi
@@ -557,6 +561,15 @@ and the runtime libraries:
 into:
 
     <SketchUp.app>/Contents/Frameworks
+
+then, in Contents/Frameworks, recreate the SONAME symlinks the zip does not carry
+(the plugins link against these names; without them SketchUp silently shows no
+USD import/export option):
+
+    ln -s libtbb.12.12.dylib      libtbb.12.dylib
+    ln -s libtbbmalloc.2.12.dylib libtbbmalloc.2.dylib
+
+(`otool -D lib/libtbb*.dylib` prints the exact names a given build expects.)
 
 The Frameworks/usd entry in the SketchUp bundle is a symlink to Resources/usd.
 Back up the existing Resources/usd folder (e.g. to Resources/usd-simlab), then
