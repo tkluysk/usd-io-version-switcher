@@ -443,6 +443,22 @@ install_04x() {
         log_cp "" "$f" "$FRAMEWORKS_DIR/"
     done < <(find "$root/lib" -maxdepth 1 -name "libtbb*")
 
+    # The JCube zips lose symlinks, so lib/ carries only the fully-versioned
+    # libtbb.12.12.dylib / libtbbmalloc.2.12.dylib — but UsdExporter.plugin and
+    # UsdImporter.plugin link against the SONAME (@rpath/libtbb.12.dylib). With no
+    # file of that name in Frameworks, dyld refuses to load both plugins and
+    # SketchUp silently drops the USD entries from its Import/Export menus.
+    # Recreate each dylib's install-name symlink where it is missing.
+    local id
+    while IFS= read -r f; do
+        id=$(otool -D "$f" 2>/dev/null | tail -n 1)
+        id=${id##*/}
+        if [[ -n "$id" && "$id" != "$(basename "$f")" && ! -e "$FRAMEWORKS_DIR/$id" ]]; then
+            echo "  ln -s $(basename "$f") -> $(shorten "$FRAMEWORKS_DIR/$id")"
+            ln -s "$(basename "$f")" "$FRAMEWORKS_DIR/$id"
+        fi
+    done < <(find "$FRAMEWORKS_DIR" -maxdepth 1 -type f -name "libtbb*.dylib")
+
     local usd_dir
     usd_dir=$(find "$root/lib" -maxdepth 1 -type d \( -name "su_usd" -o -name "usd" \) | head -1)
     [[ -n "$usd_dir" ]] && log_cp -R "$usd_dir" "$FRAMEWORKS_DIR/"
