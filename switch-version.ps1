@@ -79,24 +79,39 @@ function Get-ExporterImporterDirs([string]$sketchupDir) {
 # The build tag an install needs, e.g. '202602'. The year comes from the install
 # folder ("SketchUp 2026"); the minor from SketchUp.exe's file version (26.2 ->
 # 2), since the folder name alone doesn't carry it. Returns $null if unknown.
+#
+# The Labs/internal channel is the exception: its folder is just "SketchUp Labs"
+# with no year, and SketchUp.exe reports major 96 (96.8.140). That channel tracks
+# the NEXT release, so it maps to 2027 -- the Windows counterpart of the .2096
+# bundle id on macOS. Its minor counts the Labs build (96.8, 96.10), NOT the
+# SketchUp API minor, so feeding it through would invent tags like 202708 that
+# match no artifact; Labs therefore pins to <year>00, which is what JCube ships
+# for a not-yet-released version. A real 2027 install alongside it has its own
+# year folder and resolves through the normal path.
 function Get-SketchUpBuildTag([string]$sketchupDir) {
-    $name = Split-Path $sketchupDir -Leaf
-    if ($name -notmatch '(20\d\d)') { return $null }
-    $year = $Matches[1]
-
-    # Find SketchUp.exe (flat or nested layout) and read its file version.
+    # Read SketchUp.exe's file version (flat or nested layout) up front: it
+    # carries both the channel marker (major) and the API minor.
+    $fvMajor = $null
     $minor = 0
     foreach ($rel in @('SketchUp.exe', 'SketchUp\SketchUp.exe')) {
         $exe = Join-Path $sketchupDir $rel
         if (Test-Path $exe -PathType Leaf) {
             try {
                 $fv = (Get-Item $exe).VersionInfo.FileVersion
-                if ($fv -match '^\s*\d+\.(\d+)') { $minor = [int]$Matches[1] }
+                if ($fv -match '^\s*(\d+)\.(\d+)') {
+                    $fvMajor = [int]$Matches[1]
+                    $minor = [int]$Matches[2]
+                }
             } catch { }
             break
         }
     }
-    return ('{0}{1:D2}' -f $year, $minor)
+
+    if ($fvMajor -eq 96) { return '202700' }
+
+    $name = Split-Path $sketchupDir -Leaf
+    if ($name -notmatch '(20\d\d)') { return $null }
+    return ('{0}{1:D2}' -f $Matches[1], $minor)
 }
 
 # The build tag carried by a build root/zip name, or $null for untagged
