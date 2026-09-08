@@ -121,11 +121,22 @@ How the target tag is derived:
 
 - **macOS** — bundle id gives the year, `CFBundleShortVersionString` the minor
   (26.2 → `202602`).
-- **Windows** — the install folder gives the year, `SketchUp.exe`'s file version
-  the minor.
-- **SketchUp Labs / internal builds** (bundle id `com.sketchup.SketchUp.2096`,
-  e.g. "SketchUp 96.8") track the *next* release, so they map to `202700`. Their
-  bundle version counts the Labs build, not the API minor, so it is ignored.
+- **Windows** — the install folder gives the year (`SketchUp 2026`),
+  `SketchUp.exe`'s file version the minor; see Labs below for the install whose
+  folder carries no year.
+- **SketchUp Labs / internal builds** track the *next* release, so they map to
+  `202700`. The channel is recognised per platform, since a Labs install carries
+  no release year of its own:
+  - *macOS* — bundle id `com.sketchup.SketchUp.2096`.
+  - *Windows* — the folder is just `SketchUp Labs`, so the marker comes from
+    `SketchUp.exe`'s file version instead: major `96` (e.g. `96.8.140`) is the
+    counterpart of the `.2096` bundle id.
+
+  In both cases the minor is **ignored** — it counts the Labs build (96.8,
+  96.10), not the SketchUp API minor, so using it would invent tags like
+  `202708` that match no artifact. Labs therefore pins to `<year>00`, which is
+  what JCube ships for a not-yet-released version. A real 2027 install alongside
+  Labs reports its own year and resolves through the normal path.
 
 Versions with **no build for the selected install** are hidden from the menu;
 the prompt offers `a` to list them anyway. Even when forced, an install is
