@@ -24,6 +24,11 @@ SOURCE_KINDS=()
 SKETCHUP_APPS=()
 SKETCHUP_TARGETS=()
 
+# Versions filtered out of the menu because they have no build for the selected
+# SketchUp install(s); set SHOW_ALL_VERSIONS=1 (or 'a' at the prompt) to list them.
+HIDDEN_VERSIONS=0
+SHOW_ALL_VERSIONS="${SHOW_ALL_VERSIONS:-0}"
+
 # True if $1 is a SketchUp application bundle. Identity comes from the bundle's
 # CFBundleIdentifier (com.sketchup.SketchUp.<year>), never from the folder or
 # app name: installers vary those freely (SketchUp.app, "SketchUp 26.2.app",
@@ -40,6 +45,62 @@ is_sketchup_app() {
 # several installs are all named SketchUp.app. Echoes nothing if unreadable.
 sketchup_app_version() {
     defaults read "$1/Contents/Info" CFBundleShortVersionString 2>/dev/null || true
+}
+
+# ── SketchUp build targeting ─────────────────────────────────────────────────
+# From 1.0.0 on, JCube ships one build per SketchUp API version rather than one
+# build per platform: the artifact name carries a target tag between the commit
+# hash and the platform, e.g.
+#   SkpXyz-1.0.0-b116e5b-202602-Darwin-Release.zip   (SketchUp 2026.2)
+#   SkpXyz-1.0.0-b116e5b-202700-Darwin-Release.zip   (SketchUp 2027)
+# Builds are NOT interchangeable — the plugin links against that release's
+# SketchUp API — so each install must get the build matching its own version.
+# Releases up to 0.8.3 have no tag and are treated as universal (see below).
+
+# The SketchUp release year an app belongs to, from its bundle id
+# (com.sketchup.SketchUp.<year>). Echoes the bare year, or nothing if unreadable.
+sketchup_app_year() {
+    local bundle_id
+    bundle_id=$(defaults read "$1/Contents/Info" CFBundleIdentifier 2>/dev/null) || return 0
+    echo "${bundle_id##*.}"
+}
+
+# The build tag an install needs, derived from its bundle-id year and bundle
+# version. Echoes e.g. "202602" or "202700"; empty if it can't be determined.
+#
+# The tag is <year><minor-as-2-digits>: SketchUp 26.2 -> 202602, and a ".0"
+# release gives <year>00 -> 202600.
+#
+# The 2096 bundle id is the Labs/internal channel, which tracks the NEXT
+# release, so it maps to year 2027 (confirmed: "2096 is 27", and SketchUp 96.8
+# likewise). Its bundle version counts the Labs build (96.8, 96.10), NOT the
+# SketchUp API minor — feeding that through would invent tags like 202708 that
+# match no artifact. Labs therefore always pins to <year>00, which is what JCube
+# ships for a not-yet-released version; a real 2027 beta installed alongside it
+# reports bundle id .2027 and resolves through the normal path.
+sketchup_build_tag() {
+    local app="$1" year minor
+    year=$(sketchup_app_year "$app")
+    [[ -n "$year" ]] || return 0
+    if [[ "$year" == "2096" ]]; then
+        echo "202700"; return 0
+    fi
+    # Minor comes from the bundle version (26.2 -> 2), defaulting to 0.
+    minor=$(sketchup_app_version "$app")
+    minor="${minor#*.}"
+    [[ "$minor" =~ ^[0-9]+$ ]] || minor=0
+    printf '%s%02d' "$year" "$minor"
+}
+
+# The build tag carried by a build root/zip name, or empty for untagged
+# (pre-1.0.0) builds, which were built against a single SketchUp API and are
+# offered for every install.
+build_tag_of() {
+    local name
+    name=$(basename "$1")
+    if [[ "$name" =~ SkpXyz-[0-9.]+-[0-9a-f]+-([0-9]{6})- ]]; then
+        echo "${BASH_REMATCH[1]}"
+    fi
 }
 
 discover_sketchup_apps() {
@@ -151,11 +212,17 @@ pick_sketchup() {
     fi
 
     echo "Select SketchUp installation:"
-    local i=1 ver
+    local i=1 ver tag desc
     for app in "${available[@]}"; do
         ver=$(sketchup_app_version "$app")
-        if [[ -n "$ver" ]]; then
-            echo "  $i) $app  (v$ver)"
+        tag=$(sketchup_build_tag "$app")
+        desc=""
+        [[ -n "$ver" ]] && desc="v$ver"
+        # Show which build an install will take, so a mismatch is visible before
+        # anything is written.
+        [[ -n "$tag" ]] && desc="${desc:+$desc, }build $tag"
+        if [[ -n "$desc" ]]; then
+            echo "  $i) $app  ($desc)"
         else
             echo "  $i) $app"
         fi
@@ -211,19 +278,60 @@ discover_sources() {
         die "No build sources found (looked in $LOCAL_BUILDS_DIR, $INCOMING_DIR, and Google Drive)."
 }
 
-# Returns a Darwin root directory for the given version folder. If the folder
-# already holds an extracted *Darwin* root, that's returned as-is; otherwise a
-# *Darwin*.zip is extracted on demand into .drive-cache/.
+# Pick the build matching a tag out of newline-separated candidates on stdin.
+# Preference order:
+#   1. exact tag match          (202602 install -> 202602 build)
+#   2. same SketchUp YEAR       (202600 install -> 202602 build)
+#   3. untagged/universal build (every release up to 0.8.3)
+#
+# The minor in a build tag is the SketchUp version the build was compiled
+# against, NOT a requirement to match exactly: the SketchUp API is stable across
+# a release year, so the 202602 build installs into ANY SketchUp 26 (26.0, 26.1,
+# 26.2...). Matching the minor strictly would leave 26.0 with no installable
+# 1.0.0 build even though the 202602 one works there.
+#
+# Echoes nothing only when every candidate is tagged for a different YEAR: that
+# stays a hard failure, since a build linked against another release's SketchUp
+# API is exactly what this function exists to keep out.
+select_by_tag() {
+    local want="$1" cand untagged="" same_year="" tag
+    while IFS= read -r cand; do
+        [[ -n "$cand" ]] || continue
+        tag=$(build_tag_of "$cand")
+        if [[ -n "$want" && "$tag" == "$want" ]]; then
+            echo "$cand"; return 0
+        fi
+        # Same release year, different minor — usable, but keep looking for an
+        # exact match first. Prefer the highest such build.
+        if [[ -n "$want" && -n "$tag" && "${tag:0:4}" == "${want:0:4}" ]]; then
+            if [[ -z "$same_year" || "$tag" > "$(build_tag_of "$same_year")" ]]; then
+                same_year="$cand"
+            fi
+        fi
+        [[ -z "$tag" && -z "$untagged" ]] && untagged="$cand"
+    done
+    [[ -n "$same_year" ]] && { echo "$same_year"; return 0; }
+    # Otherwise fall back to a universal (untagged) build if there is one.
+    [[ -n "$untagged" ]] && { echo "$untagged"; return 0; }
+    return 1
+}
+
+# Returns a Darwin root directory for the given version folder, selecting the
+# build that matches $2 (a build tag such as 202602; empty = untagged/universal).
+# If the folder already holds a matching extracted *Darwin* root, that's returned
+# as-is; otherwise the matching *Darwin*.zip is extracted on demand into
+# .drive-cache/. Since 1.0.0 a version folder holds several Darwin builds, one
+# per SketchUp API, so every lookup here is tag-filtered.
 resolve_darwin_root() {
-    local dir="$1"
+    local dir="$1" want="${2-}"
     local darwin_root
-    darwin_root=$(find "$dir" -maxdepth 1 -type d -name "*Darwin*" 2>/dev/null | head -1)
+    darwin_root=$(find "$dir" -maxdepth 1 -type d -name "*Darwin*" 2>/dev/null | select_by_tag "$want")
     if [[ -n "$darwin_root" ]]; then
         echo "$darwin_root"; return 0
     fi
 
     local zip
-    zip=$(find "$dir" -maxdepth 1 -type f -name "*Darwin*.zip" 2>/dev/null | head -1)
+    zip=$(find "$dir" -maxdepth 1 -type f -name "*Darwin*.zip" 2>/dev/null | select_by_tag "$want")
     [[ -z "$zip" ]] && return 1
 
     local label cache
@@ -237,12 +345,15 @@ resolve_darwin_root() {
         label="$(basename "$dir")"
     fi
     cache="$DRIVE_CACHE_DIR/${label//\//__}"
-    darwin_root=$(find "$cache" -maxdepth 1 -type d -name "*Darwin*" 2>/dev/null | head -1)
+    # A 1.0.0+ version folder yields several Darwin roots into the same cache
+    # dir (one per SketchUp API), so these lookups filter by tag too — taking
+    # the first would hand back a build for the wrong SketchUp.
+    darwin_root=$(find "$cache" -maxdepth 1 -type d -name "*Darwin*" 2>/dev/null | select_by_tag "$want")
     if [[ -z "$darwin_root" ]]; then
         mkdir -p "$cache"
         echo "  extracting $(basename "$zip") -> .drive-cache/$label/" >&2
         unzip -q -o "$zip" -d "$cache" >&2 || return 1
-        darwin_root=$(find "$cache" -maxdepth 1 -type d -name "*Darwin*" 2>/dev/null | head -1)
+        darwin_root=$(find "$cache" -maxdepth 1 -type d -name "*Darwin*" 2>/dev/null | select_by_tag "$want")
     fi
     [[ -n "$darwin_root" ]] && echo "$darwin_root" && return 0
     return 1
@@ -267,16 +378,75 @@ add_version() {
 #   <label>\t<kind>\t<root>
 # with the label first so the whole buffer can be `sort -Vr`'d by version.
 _collect_entry() {
-    local label="$1" dir="$2" srckind="$3" root
+    local label="$1" dir="$2" srckind="$3" root n
     case "$_seen" in *"|$label|"*) return ;; esac
     if [[ "$srckind" == "dir" ]]; then
-        root=$(find "$dir" -maxdepth 1 -type d -name "*Darwin*" | head -1)
-        [[ -z "$root" ]] && return
+        # `grep -c` exits 1 on a zero count, which would abort the script under
+        # `set -e`; count with wc instead.
+        n=$(find "$dir" -maxdepth 1 -type d -name "*Darwin*" 2>/dev/null | wc -l | tr -d ' ')
+        if (( n == 0 )); then
+            # No extracted root — the folder holds zips, so treat it as a "zip"
+            # entry and let resolve_darwin_root extract the right one per app.
+            srckind="zip"; root="$dir"
+            _pending+=("$label"$'\t'"$srckind"$'\t'"$root")
+            _seen="$_seen|$label|"
+            return
+        fi
+        if (( n > 1 )); then
+            # 1.0.0+ ships one Darwin root per SketchUp API in the same folder.
+            # Which one to install depends on the target app, which isn't known
+            # until install time, so record the folder and let resolve_darwin_root
+            # pick per app — same as a "zip" entry.
+            srckind="zip"; root="$dir"
+        else
+            root=$(find "$dir" -maxdepth 1 -type d -name "*Darwin*" | head -1)
+        fi
     else
         root="$dir"
     fi
     _pending+=("$label"$'\t'"$srckind"$'\t'"$root")
     _seen="$_seen|$label|"
+}
+
+# Report whether a version has a build for every selected install. Echoes the
+# literal "INCOMPATIBLE" when none of the targets can be served, empty otherwise
+# (usable), or a note when only some targets are covered.
+#
+# Only local entries can be judged: an "api" entry hasn't been downloaded yet,
+# so its builds are unknown and it's always treated as usable — the per-app
+# resolve at install time is the real gate.
+version_compat_note() {
+    local kind="$1" root="$2" app tag ok=0 bad=0
+    [[ "$kind" == "api" ]] && return 0
+    for app in "${SKETCHUP_TARGETS[@]}"; do
+        tag=$(sketchup_build_tag "$app")
+        if version_has_build_for "$kind" "$root" "$tag"; then
+            ok=$((ok + 1))
+        else
+            bad=$((bad + 1))
+        fi
+    done
+    if (( ok == 0 )); then echo "INCOMPATIBLE"; return 0; fi
+    (( bad > 0 )) && echo "  (not for all selected installs)"
+    return 0
+}
+
+# True if the version at $2 (kind $1) provides a build for tag $3. Purely a name
+# check — no extraction — so listing stays cheap.
+version_has_build_for() {
+    local kind="$1" root="$2" want="$3" dir
+    if [[ "$kind" == "dir" ]]; then
+        # Single extracted root: it IS the build.
+        [[ -n "$(printf '%s\n' "$root" | select_by_tag "$want")" ]] && return 0
+        return 1
+    fi
+    dir="$root"
+    [[ -d "$dir" ]] || return 0   # unknown -> don't hide it
+    if find "$dir" -maxdepth 1 \( -type d -name "*Darwin*" -o -type f -name "*Darwin*.zip" \) 2>/dev/null \
+        | select_by_tag "$want" | grep -q .; then
+        return 0
+    fi
+    return 1
 }
 
 # Build a single deduplicated version list across every source in SOURCE_DIRS,
@@ -336,14 +506,24 @@ list_versions() {
     fi
 
     # Sort the merged buffer newest-first by label (version), then publish.
-    local line l_label l_kind l_root
+    # Each entry is annotated with whether it has a build for the selected
+    # install(s); unless SHOW_ALL_VERSIONS=1, incompatible ones are hidden.
+    local line l_label l_kind l_root note
     while IFS=$'\t' read -r l_label l_kind l_root; do
         [[ -z "$l_label" ]] && continue
+        note=$(version_compat_note "$l_kind" "$l_root")
+        if [[ "$note" == "INCOMPATIBLE" ]]; then
+            if [[ "${SHOW_ALL_VERSIONS:-0}" != "1" ]]; then
+                HIDDEN_VERSIONS=$((HIDDEN_VERSIONS + 1))
+                continue
+            fi
+            note="  (no build for this SketchUp)"
+        fi
         add_version "$l_label" "$l_root" "$l_kind"
         if [[ "$l_kind" == "api" ]]; then
-            echo "  $idx) $l_label  (Drive)"
+            echo "  $idx) $l_label  (Drive)$note"
         else
-            echo "  $idx) $l_label"
+            echo "  $idx) $l_label$note"
         fi
         ((idx++))
     done < <(printf '%s\n' "${_pending[@]}" | sort -Vr)
@@ -587,6 +767,30 @@ EOF
 
 # Echo a usable build root dir for a platform, extracting a release zip into a
 # temp dir on demand. Temp dirs are recorded in PKG_TMP_DIRS for cleanup.
+# Echo EVERY platform root in a version folder, one per line — a 1.0.0+ folder
+# holds one per SketchUp API. Extracted dirs are preferred; otherwise each
+# matching zip is extracted to its own temp dir (so same-named roots from
+# different zips don't collide).
+all_platform_roots() {
+    local folder="$1" dir_pat="$2" zip_pat="$3" d z tmp found=0
+    while IFS= read -r d; do
+        [[ -n "$d" ]] || continue
+        echo "$d"; found=1
+    done < <(find "$folder" -maxdepth 1 -type d -name "$dir_pat" 2>/dev/null | sort)
+    (( found )) && return 0
+
+    while IFS= read -r z; do
+        [[ -n "$z" ]] || continue
+        tmp=$(mktemp -d)
+        PKG_TMP_DIRS+=("$tmp")
+        unzip -q -o "$z" -d "$tmp" >/dev/null 2>&1 || continue
+        while IFS= read -r d; do
+            [[ -n "$d" ]] && echo "$d"
+        done < <(find "$tmp" -maxdepth 1 -type d -name "$dir_pat" 2>/dev/null | sort)
+    done < <(find "$folder" -maxdepth 1 -type f -name "$zip_pat" 2>/dev/null | sort)
+    return 0
+}
+
 get_platform_root() {
     local folder="$1" dir_pat="$2" zip_pat="$3" d z tmp
     d=$(find "$folder" -maxdepth 1 -type d -name "$dir_pat" 2>/dev/null | head -1)
@@ -659,31 +863,40 @@ generate_packages() {
     )
     for spec in "${specs[@]}"; do
         IFS='|' read -r pname dpat zpat apiplat <<<"$spec"
-        root=$(get_platform_root "$folder" "$dpat" "$zpat") || root=""
-        # Drive API fallback: a platform missing locally (e.g. an API-only
-        # version fetched for the other platform's install) is downloaded now.
-        if [[ -z "$root" ]] && drive_api_available; then
-            if dl=$(drive_api_download "$(basename "$folder")" "$apiplat"); then
-                root=$(get_platform_root "$dl" "$dpat" "$zpat") || root=""
+        # Since 1.0.0 a version holds one build per SketchUp API per platform, so
+        # package EVERY matching source, not just the first — otherwise only one
+        # SketchUp target would get a package.
+        local srcdir="$folder" roots=() r
+        if ! get_platform_root "$folder" "$dpat" "$zpat" >/dev/null 2>&1; then
+            # Drive API fallback: a platform missing locally (e.g. an API-only
+            # version fetched for the other platform's install) is downloaded now.
+            if drive_api_available && dl=$(drive_api_download "$(basename "$folder")" "$apiplat"); then
+                srcdir="$dl"
             fi
         fi
-        if [[ -z "$root" ]]; then
+        while IFS= read -r r; do
+            [[ -n "$r" ]] && roots+=("$r")
+        done < <(all_platform_roots "$srcdir" "$dpat" "$zpat")
+
+        if (( ${#roots[@]} == 0 )); then
             echo "  ($pname: no source found — skipped)"
             continue
         fi
-        top="$(basename "$root")-plugin-only"
-        out="$PACKAGES_DIR/$top.zip"
-        echo "  building $pname plugin-only package from $(basename "$root")..."
-        rm -f "$out"
-        kept=$(build_plugin_package "$pname" "$root" "$top" "$out" "$label")
-        if (( kept > 0 )); then
-            made=$((made + 1))
-            MADE_PKGS+=("$out")
-            echo "    -> packages/$top.zip  ($kept plugin items)"
-        else
-            echo "    ($pname: no plugin files found — skipped)"
+        for root in "${roots[@]}"; do
+            top="$(basename "$root")-plugin-only"
+            out="$PACKAGES_DIR/$top.zip"
+            echo "  building $pname plugin-only package from $(basename "$root")..."
             rm -f "$out"
-        fi
+            kept=$(build_plugin_package "$pname" "$root" "$top" "$out" "$label")
+            if (( kept > 0 )); then
+                made=$((made + 1))
+                MADE_PKGS+=("$out")
+                echo "    -> packages/$top.zip  ($kept plugin items)"
+            else
+                echo "    ($pname: no plugin files found — skipped)"
+                rm -f "$out"
+            fi
+        done
     done
 
     for t in "${PKG_TMP_DIRS[@]:-}"; do
@@ -751,9 +964,29 @@ echo "Available versions:"
 list_versions
 echo ""
 
-[[ ${#VERSIONS[@]} -eq 0 ]] && die "No build versions found."
+# Versions with no build for the selected install(s) are hidden by default.
+# Offer them explicitly rather than silently pretending they don't exist.
+if (( HIDDEN_VERSIONS > 0 )); then
+    echo "  ($HIDDEN_VERSIONS version(s) hidden: no build for the selected SketchUp — enter 'a' to show them)"
+    echo ""
+fi
 
-read -rp "Select version [1-${#VERSIONS[@]}]: " choice
+[[ ${#VERSIONS[@]} -eq 0 && $HIDDEN_VERSIONS -eq 0 ]] && die "No build versions found."
+
+read -rp "Select version [1-${#VERSIONS[@]}${HIDDEN_VERSIONS:+/a}]: " choice
+
+# 'a' re-lists with incompatible versions included, so one can be forced.
+if [[ "$choice" == "a" ]]; then
+    SHOW_ALL_VERSIONS=1
+    VERSIONS=(); VERSION_ROOTS=(); VERSION_KINDS=(); HIDDEN_VERSIONS=0
+    echo ""
+    echo "All versions:"
+    list_versions
+    echo ""
+    read -rp "Select version [1-${#VERSIONS[@]}]: " choice
+fi
+
+[[ ${#VERSIONS[@]} -eq 0 ]] && die "No build versions found."
 
 if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#VERSIONS[@]} )); then
     die "Invalid selection: $choice"
@@ -775,21 +1008,37 @@ if [[ "${VERSION_KINDS[$idx]}" == "api" ]]; then
     VERSION_KINDS[$idx]="zip"
 fi
 
-# Resolve the Darwin root once (extracts a zip entry into .drive-cache/ on
-# demand); "dir" entries already point at the extracted root.
-darwin_root="${VERSION_ROOTS[$idx]}"
-if [[ "${VERSION_KINDS[$idx]}" == "zip" ]]; then
-    darwin_root=$(resolve_darwin_root "$darwin_root") \
-        || die "Could not extract Darwin build for ${VERSIONS[$idx]}"
-fi
-
+# Resolution happens per app, not once: since 1.0.0 a version carries one build
+# per SketchUp API, so the right one depends on which app is being written to.
+# "dir" entries still point straight at a single extracted root (pre-1.0.0
+# layout); everything else resolves by the target app's build tag.
+installed_any=0
 for SKETCHUP_APP in "${SKETCHUP_TARGETS[@]}"; do
     PLUGINS_DIR="$SKETCHUP_APP/Contents/PlugIns"
     FRAMEWORKS_DIR="$SKETCHUP_APP/Contents/Frameworks"
     echo ""
     echo ">>> $(basename "$SKETCHUP_APP")"
     echo "    Currently installed: $(current_version)"
+
+    app_tag=$(sketchup_build_tag "$SKETCHUP_APP")
+    darwin_root="${VERSION_ROOTS[$idx]}"
+    if [[ "${VERSION_KINDS[$idx]}" == "zip" ]]; then
+        if ! darwin_root=$(resolve_darwin_root "$darwin_root" "$app_tag"); then
+            # A tagged install with no matching build must not fall back to a
+            # build for another SketchUp API — skip it and keep going, so the
+            # other selected apps still get installed.
+            echo "    SKIPPED: ${VERSIONS[$idx]} has no build for SketchUp ${app_tag:-(unknown)}." >&2
+            continue
+        fi
+    fi
+
+    echo "    Build: $(basename "$darwin_root")"
     install_version "${VERSIONS[$idx]}" "$darwin_root"
+    installed_any=1
 done
+
+if (( installed_any == 0 )); then
+    die "${VERSIONS[$idx]} has no build matching any of the selected SketchUp installs."
+fi
 
 maybe_package "${VERSIONS[$idx]}" "${VERSION_ROOTS[$idx]}" "${VERSION_KINDS[$idx]}"

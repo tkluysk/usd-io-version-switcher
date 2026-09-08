@@ -20,6 +20,11 @@ $script:DriveBuildsDir  = ''   # Drive for Desktop mount path, if found (cache-k
 $script:SourceDirs      = @()
 $script:SourceKinds     = @()
 $script:SketchUpTargets = @()
+
+# Versions filtered out of the menu because they have no build for the selected
+# SketchUp install(s); 'a' at the prompt lists them anyway.
+$script:HiddenVersions  = 0
+$script:ShowAllVersions = $false
 $script:Versions        = @()
 $script:VersionRoots    = @()
 $script:VersionKinds    = @()  # 'dir' | 'zip' | 'api', parallel to Versions
@@ -59,6 +64,79 @@ function Get-ExporterImporterDirs([string]$sketchupDir) {
         return @($flatExp, $flatImp)
     }
     return $null
+}
+
+# ── SketchUp build targeting ─────────────────────────────────────────────────
+# From 1.0.0 on, JCube ships one build per SketchUp API version rather than one
+# build per platform: the artifact name carries a target tag between the commit
+# hash and the platform, e.g.
+#   SkpXyz-1.0.0-b116e5b-202602-win64-Release.zip   (SketchUp 2026.2)
+#   SkpXyz-1.0.0-b116e5b-202700-win64-Release.zip   (SketchUp 2027)
+# Builds are NOT interchangeable — the plugin links against that release's
+# SketchUp API — so each install must get the build matching its own version.
+# Releases up to 0.8.3 have no tag and are universal.
+
+# The build tag an install needs, e.g. '202602'. The year comes from the install
+# folder ("SketchUp 2026"); the minor from SketchUp.exe's file version (26.2 ->
+# 2), since the folder name alone doesn't carry it. Returns $null if unknown.
+function Get-SketchUpBuildTag([string]$sketchupDir) {
+    $name = Split-Path $sketchupDir -Leaf
+    if ($name -notmatch '(20\d\d)') { return $null }
+    $year = $Matches[1]
+
+    # Find SketchUp.exe (flat or nested layout) and read its file version.
+    $minor = 0
+    foreach ($rel in @('SketchUp.exe', 'SketchUp\SketchUp.exe')) {
+        $exe = Join-Path $sketchupDir $rel
+        if (Test-Path $exe -PathType Leaf) {
+            try {
+                $fv = (Get-Item $exe).VersionInfo.FileVersion
+                if ($fv -match '^\s*\d+\.(\d+)') { $minor = [int]$Matches[1] }
+            } catch { }
+            break
+        }
+    }
+    return ('{0}{1:D2}' -f $year, $minor)
+}
+
+# The build tag carried by a build root/zip name, or $null for untagged
+# (pre-1.0.0) builds, which are offered for every install.
+function Get-BuildTag([string]$name) {
+    $leaf = Split-Path $name -Leaf
+    if ($leaf -match 'SkpXyz-[\d.]+-[0-9a-f]+-(\d{6})-') { return $Matches[1] }
+    return $null
+}
+
+# Pick the build matching $want out of $candidates (objects or paths).
+# Preference order:
+#   1. exact tag match          (202602 install -> 202602 build)
+#   2. same SketchUp YEAR       (202600 install -> 202602 build)
+#   3. untagged/universal build (every release up to 0.8.3)
+#
+# The minor in a build tag is the SketchUp version the build was compiled
+# against, NOT a requirement to match exactly: the SketchUp API is stable across
+# a release year, so the 202602 build installs into ANY SketchUp 26 (26.0, 26.1,
+# 26.2...). Returns $null only when every candidate is tagged for a different
+# YEAR — a build linked against another release's SketchUp API is exactly what
+# this keeps out.
+function Select-ByTag($candidates, [string]$want) {
+    $untagged = $null
+    $sameYear = $null
+    $sameYearTag = $null
+    foreach ($c in $candidates) {
+        if (-not $c) { continue }
+        $path = if ($c -is [string]) { $c } else { $c.FullName }
+        $tag = Get-BuildTag $path
+        if ($want -and $tag -eq $want) { return $c }
+        # Same release year, different minor — usable, but keep looking for an
+        # exact match first. Prefer the highest such build.
+        if ($want -and $tag -and $tag.Substring(0,4) -eq $want.Substring(0,4)) {
+            if (-not $sameYear -or $tag -gt $sameYearTag) { $sameYear = $c; $sameYearTag = $tag }
+        }
+        if (-not $tag -and -not $untagged) { $untagged = $c }
+    }
+    if ($sameYear) { return $sameYear }
+    return $untagged
 }
 
 # Locate the Python interpreter to drive sync-releases.py: prefer the repo-local
@@ -196,7 +274,11 @@ function Select-SketchUp {
 
     Write-Host "Select SketchUp installation:"
     for ($i = 0; $i -lt $available.Count; $i++) {
-        Write-Host "  $($i+1)) $($available[$i])"
+        # Show which build an install will take, so a mismatch is visible before
+        # anything is written.
+        $tag = Get-SketchUpBuildTag $available[$i]
+        if ($tag) { Write-Host "  $($i+1)) $($available[$i])  (build $tag)" }
+        else      { Write-Host "  $($i+1)) $($available[$i])" }
     }
     Write-Host "  a) All of the above"
     Write-Host ""
@@ -210,16 +292,16 @@ function Select-SketchUp {
     }
 }
 
-# Returns a win64-Release root dir for the given version folder. If the folder
-# already holds an extracted *win64-Release* root, that's returned as-is;
-# otherwise a *win64-Release*.zip is extracted on demand into .drive-cache\.
-function Resolve-WindowsRoot([string]$dir) {
-    $winDir = Get-ChildItem $dir -Directory -Filter '*win64-Release*' -ErrorAction SilentlyContinue |
-              Select-Object -First 1
+# Returns a win64-Release root dir for the given version folder, selecting the
+# build matching $want (a tag such as 202602; $null/empty = untagged/universal).
+# Since 1.0.0 a version folder holds several win64 builds, one per SketchUp API,
+# so every lookup here is tag-filtered — taking the first would hand back a
+# build for the wrong SketchUp.
+function Resolve-WindowsRoot([string]$dir, [string]$want) {
+    $winDir = Select-ByTag (Get-ChildItem $dir -Directory -Filter '*win64-Release*' -ErrorAction SilentlyContinue) $want
     if ($winDir) { return $winDir.FullName }
 
-    $zip = Get-ChildItem $dir -File -Filter '*win64-Release*.zip' -ErrorAction SilentlyContinue |
-           Select-Object -First 1
+    $zip = Select-ByTag (Get-ChildItem $dir -File -Filter '*win64-Release*.zip' -ErrorAction SilentlyContinue) $want
     if (-not $zip) { return $null }
 
     # Use the dir path relative to its source root as a stable cache key.
@@ -232,17 +314,30 @@ function Resolve-WindowsRoot([string]$dir) {
         $label = Split-Path -Leaf $dir
     }
     $cache = Join-Path $DriveCacheDir ($label -replace '\\', '__')
-    $winDir = Get-ChildItem $cache -Directory -Filter '*win64-Release*' -ErrorAction SilentlyContinue |
-              Select-Object -First 1
+    # Several builds from one version land in the same cache dir, so filter by
+    # tag here too.
+    $winDir = Select-ByTag (Get-ChildItem $cache -Directory -Filter '*win64-Release*' -ErrorAction SilentlyContinue) $want
     if (-not $winDir) {
         New-Item -ItemType Directory -Force $cache | Out-Null
         Write-Host "  extracting $($zip.Name) -> .drive-cache\$label\" -ForegroundColor DarkGray
         Expand-Archive -Path $zip.FullName -DestinationPath $cache -Force
-        $winDir = Get-ChildItem $cache -Directory -Filter '*win64-Release*' -ErrorAction SilentlyContinue |
-                  Select-Object -First 1
+        $winDir = Select-ByTag (Get-ChildItem $cache -Directory -Filter '*win64-Release*' -ErrorAction SilentlyContinue) $want
     }
     if ($winDir) { return $winDir.FullName }
     return $null
+}
+
+# True if the version at $root (kind $kind) provides a build for tag $want.
+# Name check only — no extraction — so listing stays cheap. 'api' entries aren't
+# downloaded yet, so they're always considered usable.
+function Test-VersionHasBuildFor([string]$kind, [string]$root, [string]$want) {
+    if ($kind -eq 'api') { return $true }
+    if ($kind -eq 'dir') { return [bool](Select-ByTag @($root) $want) }
+    if (-not (Test-Path $root -PathType Container)) { return $true }
+    $cands = @()
+    $cands += Get-ChildItem $root -Directory -Filter '*win64-Release*'    -ErrorAction SilentlyContinue
+    $cands += Get-ChildItem $root -File      -Filter '*win64-Release*.zip' -ErrorAction SilentlyContinue
+    return [bool](Select-ByTag $cands $want)
 }
 
 # True if a folder directly contains an extracted *win64-Release* root or a
@@ -265,10 +360,19 @@ function Test-PreRelease([string]$label) {
 function Add-PendingVersion($pending, $seen, [string]$label, [string]$dir, [string]$srcKind) {
     if ($seen.ContainsKey($label)) { return }
     if ($srcKind -eq 'dir') {
-        $root = Get-ChildItem $dir -Directory -Filter '*win64-Release*' -ErrorAction SilentlyContinue |
-                Select-Object -First 1
-        if (-not $root) { return }
-        $root = $root.FullName
+        $roots = @(Get-ChildItem $dir -Directory -Filter '*win64-Release*' -ErrorAction SilentlyContinue)
+        if ($roots.Count -eq 0) {
+            # No extracted root — the folder holds zips; treat as a 'zip' entry
+            # so Resolve-WindowsRoot picks the right one per install.
+            $srcKind = 'zip'; $root = $dir
+        } elseif ($roots.Count -gt 1) {
+            # 1.0.0+ ships one root per SketchUp API in the same folder. Which
+            # to install depends on the target, unknown until install time, so
+            # record the folder and resolve per app.
+            $srcKind = 'zip'; $root = $dir
+        } else {
+            $root = $roots[0].FullName
+        }
     } else {
         $root = $dir
     }
@@ -328,13 +432,26 @@ function Get-Versions {
     # Sort the merged buffer newest-first by version, then publish + display.
     $sorted = $pending |
               Sort-Object { [version]($_.Label -replace '^.*?(\d+\.\d+(\.\d+)*).*$','$1') } -Descending -ErrorAction SilentlyContinue
+    # Each entry is annotated with whether it has a build for the selected
+    # install(s); unless $script:ShowAllVersions, incompatible ones are hidden.
     $idx = 1
     foreach ($v in $sorted) {
+        $ok = 0; $bad = 0
+        foreach ($app in $script:SketchUpTargets) {
+            if (Test-VersionHasBuildFor $v.Kind $v.Root (Get-SketchUpBuildTag $app)) { $ok++ } else { $bad++ }
+        }
+        $note = ''
+        if ($ok -eq 0) {
+            if (-not $script:ShowAllVersions) { $script:HiddenVersions++; continue }
+            $note = '  (no build for this SketchUp)'
+        } elseif ($bad -gt 0) {
+            $note = '  (not for all selected installs)'
+        }
         $script:Versions     += $v.Label
         $script:VersionRoots += $v.Root
         $script:VersionKinds += $v.Kind
-        if ($v.Kind -eq 'api') { Write-Host "  $idx) $($v.Label)  (Drive)" }
-        else                   { Write-Host "  $idx) $($v.Label)" }
+        if ($v.Kind -eq 'api') { Write-Host "  $idx) $($v.Label)  (Drive)$note" }
+        else                   { Write-Host "  $idx) $($v.Label)$note" }
         $idx++
     }
 }
@@ -635,36 +752,46 @@ function Invoke-GeneratePackages([string]$label, [string]$versionRoot, [string]$
 
     $made = @()
     foreach ($p in $platforms) {
-        $srcZip = Get-ChildItem $verFolder -File -Filter $p.ZipPat -ErrorAction SilentlyContinue | Select-Object -First 1
-        # Drive API fallback: a platform zip missing locally (e.g. an API-only
+        # Since 1.0.0 a version holds one build per SketchUp API per platform, so
+        # package EVERY matching source, not just the first — otherwise only one
+        # SketchUp target would get a package.
+        $srcZips = @(Get-ChildItem $verFolder -File -Filter $p.ZipPat -ErrorAction SilentlyContinue)
+        # Drive API fallback: a platform missing locally (e.g. an API-only
         # version fetched for the other platform's install) is downloaded now.
-        if (-not $srcZip -and (Test-DriveApiAvailable)) {
+        if ($srcZips.Count -eq 0 -and (Test-DriveApiAvailable)) {
             $dl = Invoke-DriveApiDownload (Split-Path -Leaf $verFolder) $p.ApiPlat
-            if ($dl) { $srcZip = Get-ChildItem $dl -File -Filter $p.ZipPat -ErrorAction SilentlyContinue | Select-Object -First 1 }
-        }
-        if ($srcZip) {
-            $top    = [System.IO.Path]::GetFileNameWithoutExtension($srcZip.Name) + '-plugin-only'
-            $outZip = Join-Path $PackagesDir ($top + '.zip')
-            Write-Host "  building $($p.Name) plugin-only package from $($srcZip.Name)..."
-            $kept = New-PluginZipFromZip $srcZip.FullName $outZip $top $p.Name $label
-        } else {
-            $dir = Get-ChildItem $verFolder -Directory -Filter $p.DirPat -ErrorAction SilentlyContinue | Select-Object -First 1
-            if (-not $dir) {
-                Write-Host "  ($($p.Name): no $($p.DirPat) source found - skipped)" -ForegroundColor Yellow
-                continue
-            }
-            $top    = $dir.Name + '-plugin-only'
-            $outZip = Join-Path $PackagesDir ($top + '.zip')
-            Write-Host "  building $($p.Name) plugin-only package from $($dir.Name)\..."
-            $kept = New-PluginZipFromDir $dir.FullName $outZip $top $p.Name $label
+            if ($dl) { $srcZips = @(Get-ChildItem $dl -File -Filter $p.ZipPat -ErrorAction SilentlyContinue) }
         }
 
-        if ($kept -gt 0) {
-            $made += $outZip
-            Write-Host "    -> packages\$(Split-Path -Leaf $outZip)  ($kept plugin items)" -ForegroundColor Green
-        } else {
-            Write-Host "    ($($p.Name): no plugin files found - skipped)" -ForegroundColor Yellow
-            if (Test-Path $outZip) { Remove-Item $outZip -Force -ErrorAction SilentlyContinue }
+        $sources = @()
+        foreach ($z in $srcZips) {
+            $sources += @{ IsZip = $true; Path = $z.FullName; Name = $z.Name
+                           Top = [System.IO.Path]::GetFileNameWithoutExtension($z.Name) + '-plugin-only' }
+        }
+        if ($sources.Count -eq 0) {
+            foreach ($d in @(Get-ChildItem $verFolder -Directory -Filter $p.DirPat -ErrorAction SilentlyContinue)) {
+                $sources += @{ IsZip = $false; Path = $d.FullName; Name = "$($d.Name)\"
+                               Top = $d.Name + '-plugin-only' }
+            }
+        }
+        if ($sources.Count -eq 0) {
+            Write-Host "  ($($p.Name): no $($p.DirPat) source found - skipped)" -ForegroundColor Yellow
+            continue
+        }
+
+        foreach ($s in $sources) {
+            $outZip = Join-Path $PackagesDir ($s.Top + '.zip')
+            Write-Host "  building $($p.Name) plugin-only package from $($s.Name)..."
+            if ($s.IsZip) { $kept = New-PluginZipFromZip $s.Path $outZip $s.Top $p.Name $label }
+            else          { $kept = New-PluginZipFromDir $s.Path $outZip $s.Top $p.Name $label }
+
+            if ($kept -gt 0) {
+                $made += $outZip
+                Write-Host "    -> packages\$(Split-Path -Leaf $outZip)  ($kept plugin items)" -ForegroundColor Green
+            } else {
+                Write-Host "    ($($p.Name): no plugin files found - skipped)" -ForegroundColor Yellow
+                if (Test-Path $outZip) { Remove-Item $outZip -Force -ErrorAction SilentlyContinue }
+            }
         }
     }
 
@@ -733,9 +860,33 @@ Write-Host "Available versions:"
 Get-Versions
 Write-Host ""
 
+# Versions with no build for the selected install(s) are hidden by default.
+# Offer them explicitly rather than silently pretending they don't exist.
+if ($script:HiddenVersions -gt 0) {
+    Write-Host "  ($($script:HiddenVersions) version(s) hidden: no build for the selected SketchUp - enter 'a' to show them)" -ForegroundColor DarkGray
+    Write-Host ""
+}
+
+if ($script:Versions.Count -eq 0 -and $script:HiddenVersions -eq 0) { Die "No build versions found." }
+
+$prompt = "Select version [1-$($script:Versions.Count)]"
+if ($script:HiddenVersions -gt 0) { $prompt = "Select version [1-$($script:Versions.Count)/a]" }
+$choice = Read-Host $prompt
+
+# 'a' re-lists with incompatible versions included, so one can be forced.
+if ($choice -eq 'a') {
+    $script:ShowAllVersions = $true
+    $script:Versions = @(); $script:VersionRoots = @(); $script:VersionKinds = @()
+    $script:HiddenVersions = 0
+    Write-Host ""
+    Write-Host "All versions:"
+    Get-Versions
+    Write-Host ""
+    $choice = Read-Host "Select version [1-$($script:Versions.Count)]"
+}
+
 if ($script:Versions.Count -eq 0) { Die "No build versions found." }
 
-$choice = Read-Host "Select version [1-$($script:Versions.Count)]"
 if ($choice -notmatch '^\d+$' -or [int]$choice -lt 1 -or [int]$choice -gt $script:Versions.Count) {
     Die "Invalid selection: $choice"
 }
@@ -754,14 +905,11 @@ if ($script:VersionKinds[$idx] -eq 'api') {
     $script:VersionKinds[$idx] = 'zip'
 }
 
-# Resolve the win64 root once ('zip' entries extract on demand into .drive-cache\;
-# 'dir' entries already point at the extracted root).
-$winRoot = $script:VersionRoots[$idx]
-if ($script:VersionKinds[$idx] -eq 'zip') {
-    $winRoot = Resolve-WindowsRoot $winRoot
-    if (-not $winRoot) { Die "Could not extract Windows build for $($script:Versions[$idx])" }
-}
-
+# Resolution happens per install, not once: since 1.0.0 a version carries one
+# build per SketchUp API, so the right one depends on which install is written
+# to. 'dir' entries still point straight at a single extracted root (pre-1.0.0
+# layout); everything else resolves by the target's build tag.
+$installedAny = $false
 foreach ($sketchupDir in $script:SketchUpTargets) {
     $dirs = Get-ExporterImporterDirs $sketchupDir
     if (-not $dirs) { Die "Exporters/Importers folders not found under $sketchupDir" }
@@ -772,7 +920,27 @@ foreach ($sketchupDir in $script:SketchUpTargets) {
     Write-Host ">>> $(Split-Path -Leaf $sketchupDir)"
     Write-Host "    Currently installed: $(Get-CurrentVersion)"
 
+    $appTag  = Get-SketchUpBuildTag $sketchupDir
+    $winRoot = $script:VersionRoots[$idx]
+    if ($script:VersionKinds[$idx] -eq 'zip') {
+        $winRoot = Resolve-WindowsRoot $winRoot $appTag
+        if (-not $winRoot) {
+            # A tagged install with no matching build must not fall back to a
+            # build for another SketchUp API — skip it, but keep going so the
+            # other selected installs still get done.
+            $shown = if ($appTag) { $appTag } else { '(unknown)' }
+            Write-Host "    SKIPPED: $($script:Versions[$idx]) has no build for SketchUp $shown." -ForegroundColor Yellow
+            continue
+        }
+    }
+
+    Write-Host "    Build: $(Split-Path -Leaf $winRoot)"
     Install-Version $script:Versions[$idx] $winRoot
+    $installedAny = $true
+}
+
+if (-not $installedAny) {
+    Die "$($script:Versions[$idx]) has no build matching any of the selected SketchUp installs."
 }
 
 Invoke-MaybePackage $script:Versions[$idx] $script:VersionRoots[$idx] $script:VersionKinds[$idx]

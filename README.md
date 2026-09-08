@@ -74,8 +74,63 @@ of defence, cheapest first:
 
 ### macOS
 
-Run `switch-version.sh` (or double-click `USD IO Switcher.app`). The
-script targets the SketchUp apps hard-coded near the top of the file.
+Run `switch-version.sh` (or double-click `USD IO Switcher.app`). SketchUp
+installs are auto-discovered under `/Applications` (and one level down), each
+identified by its bundle id (`com.sketchup.SketchUp.<year>`) rather than by app
+or folder name, so unconventional installer layouts are still found.
+
+## Per-SketchUp builds (1.0.0 and later)
+
+From **1.0.0**, JCube ships one build **per SketchUp API version** instead of
+one per platform. The target is encoded in the artifact name, between the commit
+hash and the platform:
+
+```
+SkpXyz-1.0.0-b116e5b-202602-Darwin-Release.zip   -> SketchUp 26 (built against 26.2)
+SkpXyz-1.0.0-b116e5b-202700-Darwin-Release.zip   -> SketchUp 27 (built against 27.0)
+```
+
+So a single release is 6 artifacts (4 Release + 2 Debug) rather than 3.
+
+**Builds are not interchangeable across release years** — each links against
+that year's SketchUp API — so the switcher resolves the build **per install**,
+not once per run. Selecting "all" installs a different build into each SketchUp
+in the same pass:
+
+```
+>>> SketchUp 26.2.app
+    Build: SkpXyz-1.0.0-b116e5b-202602-Darwin-Release
+>>> SketchUp Labs.app
+    Build: SkpXyz-1.0.0-b116e5b-202700-Darwin-Release
+```
+
+**The minor in a tag is what the build was compiled against, not a strict
+requirement.** The SketchUp API is stable within a release year, so the `202602`
+build installs into **any** SketchUp 26 — 26.0, 26.1, 26.2. Matching is
+therefore:
+
+1. exact tag (`202602` install → `202602` build);
+2. otherwise the highest build of the **same year** (`202600` install → `202602`
+   build);
+3. otherwise an untagged/universal build.
+
+Only a mismatched **year** is refused, so a SketchUp 25 install gets no 1.0.0
+build at all.
+
+How the target tag is derived:
+
+- **macOS** — bundle id gives the year, `CFBundleShortVersionString` the minor
+  (26.2 → `202602`).
+- **Windows** — the install folder gives the year, `SketchUp.exe`'s file version
+  the minor.
+- **SketchUp Labs / internal builds** (bundle id `com.sketchup.SketchUp.2096`,
+  e.g. "SketchUp 96.8") track the *next* release, so they map to `202700`. Their
+  bundle version counts the Labs build, not the API minor, so it is ignored.
+
+Versions with **no build for the selected install** are hidden from the menu;
+the prompt offers `a` to list them anyway. Even when forced, an install is
+skipped rather than given a build from a different SketchUp year. Releases up to
+**0.8.3** carry no tag, are treated as universal, and still install everywhere.
 
 ## Plugin-only packages (optional)
 
@@ -96,8 +151,11 @@ conversions outside SketchUp.
 
 - Both `win64-Release` and `Darwin-Release` are packaged regardless of which OS
   you run the switcher on; Debug builds are ignored.
+- **Every** build is packaged, not just one per platform: from 1.0.0 that means
+  one package per SketchUp target per platform (so 1.0.0 yields 4 packages —
+  `202602` and `202700` × Windows and macOS).
 - Output goes to `packages/` in the repo (gitignored), named
-  `SkpXyz-<ver>-<hash>-<platform>-Release-plugin-only.zip`.
+  `SkpXyz-<ver>-<hash>[-<sketchup>]-<platform>-Release-plugin-only.zip`.
 - File contents are copied byte-for-byte, so existing macOS code signatures
   stay intact. When the macOS package is built on Windows, Unix exec bits are
   not reproduced (harmless — SketchUp loads the plugin binaries via `dlopen`,

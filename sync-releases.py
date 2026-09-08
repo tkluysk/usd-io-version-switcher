@@ -321,24 +321,39 @@ def _is_release_zip(name: str, platform: str) -> bool:
 def list_deliverables() -> None:
     """Print one tab-separated line per version folder that holds at least one
     Release zip:  <label>\\t<win64_zip|-->\\t<darwin_zip|-->. Consumed by the
-    switcher's Drive-API fallback to enumerate versions with no local copy."""
+    switcher's Drive-API fallback to enumerate versions with no local copy.
+
+    From 1.0.0 a version ships one build per SketchUp API (…-202602-…,
+    …-202700-…), so a folder holds several zips per platform. The switcher only
+    needs to know a platform EXISTS here — it picks the right build by tag once
+    downloaded — so the newest name per platform is reported.
+    """
     service = _gdrive_service()
     for item in _list_folder(service, DELIVERABLES_FOLDER_ID):
         if item["mimeType"] != "application/vnd.google-apps.folder":
             continue
-        win = dar = "-"
+        wins, dars = [], []
         for child in _list_folder(service, item["id"]):
             if _is_release_zip(child["name"], "win64"):
-                win = child["name"]
+                wins.append(child["name"])
             elif _is_release_zip(child["name"], "Darwin"):
-                dar = child["name"]
+                dars.append(child["name"])
+        win = max(wins) if wins else "-"
+        dar = max(dars) if dars else "-"
         if win != "-" or dar != "-":
             print(f"{item['name']}\t{win}\t{dar}")
 
 
 def download_deliverable(label: str, platform: str, destdir: str) -> None:
-    """Download the <platform> ('win64'|'Darwin') Release zip for version folder
-    <label> into <destdir>. Prints the saved path as the final stdout line."""
+    """Download the <platform> ('win64'|'Darwin') Release zip(s) for version
+    folder <label> into <destdir>. Prints the destination dir as the final
+    stdout line.
+
+    From 1.0.0 a version ships one build per SketchUp API (…-202602-…,
+    …-202700-…). ALL of them are fetched: the switcher can't know which
+    SketchUp the user will target until it resolves per install, and picks the
+    matching build by tag from what's staged here.
+    """
     from googleapiclient.http import MediaIoBaseDownload
 
     service = _gdrive_service()
@@ -351,26 +366,33 @@ def download_deliverable(label: str, platform: str, destdir: str) -> None:
         print(f"[download] version folder not found: {label}", file=sys.stderr)
         sys.exit(2)
 
-    target = next((c for c in _list_folder(service, folder_id)
-                   if _is_release_zip(c["name"], platform)), None)
-    if not target:
+    targets = [c for c in _list_folder(service, folder_id)
+               if _is_release_zip(c["name"], platform)]
+    if not targets:
         print(f"[download] no {platform} Release zip in {label}", file=sys.stderr)
         sys.exit(3)
 
     dest_dir = Path(destdir)
     dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / target["name"]
 
-    req = service.files().get_media(fileId=target["id"], supportsAllDrives=True)
-    with io.FileIO(str(dest), "wb") as buf:
-        downloader = MediaIoBaseDownload(buf, req, chunksize=8 * 1024 * 1024)
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
-            if status:
-                print(f"\r  {int(status.progress() * 100)}%", end="", flush=True)
-    print()
-    print(str(dest))
+    for target in sorted(targets, key=lambda c: c["name"]):
+        dest = dest_dir / target["name"]
+        if dest.is_file():
+            print(f"  {target['name']} (already staged)", file=sys.stderr)
+            continue
+        print(f"  {target['name']}", file=sys.stderr)
+        req = service.files().get_media(fileId=target["id"], supportsAllDrives=True)
+        with io.FileIO(str(dest), "wb") as buf:
+            downloader = MediaIoBaseDownload(buf, req, chunksize=8 * 1024 * 1024)
+            done = False
+            while not done:
+                status, done = downloader.next_chunk()
+                if status:
+                    print(f"\r  {int(status.progress() * 100)}%", end="", flush=True,
+                          file=sys.stderr)
+        print(file=sys.stderr)
+
+    print(str(dest_dir))
 
 
 def _stage_locally(version_folder: str, zip_name: str, data: bytes) -> None:
