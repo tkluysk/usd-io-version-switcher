@@ -16,6 +16,7 @@ Wiki is sparse-cloned at ~/.cache/usd-switcher/wiki/
 from __future__ import annotations
 
 import argparse
+import contextlib
 import io
 import json
 import os
@@ -77,6 +78,16 @@ def _gdrive_service():
             # Self-heal by re-running the browser auth flow.
             if "invalid_grant" not in str(e):
                 raise
+            # Callers whose output is consumed by a script (the switcher's
+            # background Drive probes) set NO_INTERACTIVE_AUTH: opening a browser
+            # there would block on a prompt the user never sees, because those
+            # callers discard stderr. Fail cleanly instead — the switcher just
+            # carries on with whatever builds are local, and the explicit
+            # "Check GitLab for new versions" step re-auths interactively.
+            if os.environ.get("USD_SWITCHER_NO_INTERACTIVE_AUTH"):
+                raise RuntimeError(
+                    "Drive credentials expired - run the sync step to re-authorise."
+                ) from e
             print(
                 "[auth] Refresh token revoked or expired - re-running browser auth.\n"
                 "       (Google caps refresh tokens at 7 days for Testing-status OAuth\n"
@@ -102,12 +113,20 @@ def do_auth(client_secret_path: Path | None = None):
         print(
             f"Client secret file not found: {src}\n"
             "Pass it with:  python3 sync-releases.py --auth --client-secret <path>\n"
-            "Download it from: https://console.cloud.google.com/ → APIs & Services → Credentials"
+            "Download it from: https://console.cloud.google.com/ → APIs & Services → Credentials",
+            file=sys.stderr,
         )
         sys.exit(1)
 
     flow = InstalledAppFlow.from_client_secrets_file(str(src), SCOPES)
-    creds = flow.run_local_server(port=0)
+    # run_local_server() prints "Please visit this URL to authorize..." to
+    # stdout. Auth can fire from inside ANY command — _gdrive_service()
+    # self-heals an expired refresh token by calling do_auth() — and commands
+    # like --list-deliverables have machine-readable stdout that the switcher
+    # parses. Without this redirect the auth prompt is read as a version row and
+    # shows up as "1) Please visit this URL..." in the switcher's menu.
+    with contextlib.redirect_stdout(sys.stderr):
+        creds = flow.run_local_server(port=0)
     _save_creds(creds)
     # Copy the client secret to its canonical location for future refreshes,
     # unless src already IS the canonical location (Windows shutil.copy2 of a
@@ -116,7 +135,9 @@ def do_auth(client_secret_path: Path | None = None):
         import shutil
         CLIENT_SECRET_FILE.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, CLIENT_SECRET_FILE)
-    print(f"Credentials saved to {GDRIVE_CREDS_FILE}")
+    # stderr for the same reason as the redirect above: do_auth() can run inside
+    # a command whose stdout is parsed.
+    print(f"Credentials saved to {GDRIVE_CREDS_FILE}", file=sys.stderr)
 
 
 # ── Drive helpers ─────────────────────────────────────────────────────────────

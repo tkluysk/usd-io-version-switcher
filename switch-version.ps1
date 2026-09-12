@@ -181,8 +181,14 @@ function Get-DriveApiVersions {
     $py = Resolve-Python
     if (-not $py) { return @() }
     $syncScript = Join-Path $ScriptDir 'sync-releases.py'
+    # This runs silently in the background of the version listing and its stderr
+    # is discarded, so it must never start an interactive browser auth — the user
+    # would see an unexplained hang. NO_INTERACTIVE_AUTH makes an expired token a
+    # clean failure; the "Check GitLab for new versions" prompt re-auths visibly.
     try {
-        $lines = & $py $syncScript --list-deliverables 2>$null
+        $env:USD_SWITCHER_NO_INTERACTIVE_AUTH = '1'
+        try   { $lines = & $py $syncScript --list-deliverables 2>$null }
+        finally { Remove-Item Env:\USD_SWITCHER_NO_INTERACTIVE_AUTH -ErrorAction SilentlyContinue }
         if ($LASTEXITCODE -ne 0) { return @() }
     } catch { return @() }
 
@@ -190,7 +196,12 @@ function Get-DriveApiVersions {
     foreach ($line in $lines) {
         if (-not $line) { continue }
         $parts = $line -split "`t"
+        # Only accept well-formed "<label><TAB><win><TAB><darwin>" rows. Anything
+        # else on stdout is not version data — e.g. an OAuth "Please visit this
+        # URL to authorize..." prompt, which the auth flow can emit from inside
+        # any command when a refresh token has expired.
         if ($parts.Count -lt 3) { continue }
+        if ($parts[0] -notmatch '\d+\.\d+') { continue }
         $out += [pscustomobject]@{
             Label  = $parts[0]
             Win    = if ($parts[1] -eq '-') { $null } else { $parts[1] }

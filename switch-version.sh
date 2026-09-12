@@ -157,10 +157,15 @@ drive_api_available() {
 
 # Echo raw "label<TAB>win64_zip<TAB>darwin_zip" lines for every Deliverables
 # version, or return non-zero on failure (offline, no creds, ...).
+# This runs silently in the background of the version listing and its stderr is
+# discarded, so it must never start an interactive browser auth — the user would
+# see an unexplained hang. NO_INTERACTIVE_AUTH makes an expired token a clean
+# failure; the "Check GitLab for new versions" prompt re-auths visibly instead.
 get_drive_api_versions() {
     local py
     py=$(find_python) || return 1
-    "$py" "$SCRIPT_DIR/sync-releases.py" --list-deliverables 2>/dev/null || return 1
+    USD_SWITCHER_NO_INTERACTIVE_AUTH=1 \
+        "$py" "$SCRIPT_DIR/sync-releases.py" --list-deliverables 2>/dev/null || return 1
 }
 
 # Download a version's platform ('win64'|'Darwin') Release zip into
@@ -495,6 +500,13 @@ list_versions() {
         local lbl win dar
         while IFS=$'\t' read -r lbl win dar; do
             [[ -z "$lbl" ]] && continue
+            # Only accept well-formed "<label><TAB><win><TAB><darwin>" rows.
+            # Anything else on stdout is not version data — e.g. an OAuth
+            # "Please visit this URL to authorize..." prompt, which the auth
+            # flow can emit from inside any command when a refresh token has
+            # expired. Without this guard such a line became a menu entry.
+            [[ -z "$win" || -z "$dar" ]] && continue
+            [[ "$lbl" =~ [0-9]+\.[0-9]+ ]] || continue
             case "$_seen" in *"|$lbl|"*) continue ;; esac
             [[ "$dar" == "-" ]] && continue   # need a macOS build to install here
             if [[ "$lbl" =~ [[:space:]]0\.([0-3])\. ]] || [[ "$lbl" =~ [[:space:]]0\.[0-3]$ ]]; then
