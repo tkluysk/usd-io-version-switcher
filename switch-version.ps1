@@ -124,33 +124,41 @@ function Get-BuildTag([string]$name) {
 
 # Pick the build matching $want out of $candidates (objects or paths).
 # Preference order:
-#   1. exact tag match          (202602 install -> 202602 build)
-#   2. same SketchUp YEAR       (202600 install -> 202602 build)
-#   3. untagged/universal build (every release up to 0.8.3)
+#   1. exact tag match             (202602 install -> 202602 build)
+#   2. same YEAR, build minor <=   (202603 install -> 202602 build)
+#      the install's minor
+#   3. untagged/universal build    (every release up to 0.8.3)
 #
 # The minor in a build tag is the SketchUp version the build was compiled
-# against, NOT a requirement to match exactly: the SketchUp API is stable across
-# a release year, so the 202602 build installs into ANY SketchUp 26 (26.0, 26.1,
-# 26.2...). Returns $null only when every candidate is tagged for a different
-# YEAR — a build linked against another release's SketchUp API is exactly what
-# this keeps out.
+# against, and it is a MINIMUM, not a label: a build compiled against 26.2 links
+# API symbols that earlier 26.x releases don't export, so it loads on 26.2+ but
+# NOT on 26.0. Installing it there looks like it works — the files copy fine —
+# but the loader rejects the plugin and SketchUp silently drops the USD entries
+# from its Import/Export menus, leaving only the other exporters.
+# (Observed with 1.0.1/1.0.2's 202602 build on SketchUp 26.0: libSkpXyz needs
+# SUEnvironmentsSetSelectedEnvironment, which 26.0's SketchUpAPI lacks.)
+#
+# So a build is only offered when its minor is <= the install's minor. Returning
+# $null is the correct answer for an install that is too old — a visible skip
+# beats a silently broken install.
 function Select-ByTag($candidates, [string]$want) {
     $untagged = $null
-    $sameYear = $null
-    $sameYearTag = $null
+    $best = $null
+    $bestTag = $null
     foreach ($c in $candidates) {
         if (-not $c) { continue }
         $path = if ($c -is [string]) { $c } else { $c.FullName }
         $tag = Get-BuildTag $path
         if ($want -and $tag -eq $want) { return $c }
-        # Same release year, different minor — usable, but keep looking for an
-        # exact match first. Prefer the highest such build.
-        if ($want -and $tag -and $tag.Substring(0,4) -eq $want.Substring(0,4)) {
-            if (-not $sameYear -or $tag -gt $sameYearTag) { $sameYear = $c; $sameYearTag = $tag }
+        # Same release year AND not newer than the install: usable. Keep the
+        # highest such build, but keep looking for an exact match first.
+        if ($want -and $tag -and $tag.Substring(0,4) -eq $want.Substring(0,4) -and
+            [int]$tag.Substring(4,2) -le [int]$want.Substring(4,2)) {
+            if (-not $best -or $tag -gt $bestTag) { $best = $c; $bestTag = $tag }
         }
         if (-not $tag -and -not $untagged) { $untagged = $c }
     }
-    if ($sameYear) { return $sameYear }
+    if ($best) { return $best }
     return $untagged
 }
 
@@ -955,7 +963,9 @@ foreach ($sketchupDir in $script:SketchUpTargets) {
             # build for another SketchUp API — skip it, but keep going so the
             # other selected installs still get done.
             $shown = if ($appTag) { $appTag } else { '(unknown)' }
-            Write-Host "    SKIPPED: $($script:Versions[$idx]) has no build for SketchUp $shown." -ForegroundColor Yellow
+            Write-Host "    SKIPPED: $($script:Versions[$idx]) has no build this SketchUp can load (needs $shown or older)." -ForegroundColor Yellow
+            Write-Host "             A newer build links API symbols this SketchUp doesn't export;" -ForegroundColor Yellow
+            Write-Host "             installing it would silently drop the USD menu entries." -ForegroundColor Yellow
             continue
         }
     }

@@ -104,18 +104,35 @@ in the same pass:
     Build: SkpXyz-1.0.0-b116e5b-202700-Darwin-Release
 ```
 
-**The minor in a tag is what the build was compiled against, not a strict
-requirement.** The SketchUp API is stable within a release year, so the `202602`
-build installs into **any** SketchUp 26 — 26.0, 26.1, 26.2. Matching is
-therefore:
+**The minor in a tag is the SketchUp version the build was compiled against, and
+it is a minimum.** A build compiled against 26.2 links API symbols that earlier
+26.x releases don't export, so `202602` runs on 26.2 and newer but **not** on
+26.0. Matching is therefore:
 
 1. exact tag (`202602` install → `202602` build);
-2. otherwise the highest build of the **same year** (`202600` install → `202602`
-   build);
+2. otherwise the highest build of the **same year whose minor is ≤ the
+   install's** (`202603` install → `202602` build);
 3. otherwise an untagged/universal build.
 
-Only a mismatched **year** is refused, so a SketchUp 25 install gets no 1.0.0
-build at all.
+An install older than every build of its year is **skipped**, and so is a
+mismatched year — a SketchUp 25 install gets no 1.0.x build at all.
+
+> **Why the skip matters.** A too-new build *appears* to install: every file
+> copies without error. But the loader then rejects the plugin, and SketchUp
+> silently drops the USD entries from its Import/Export menus — you're left with
+> just the other exporters and no error anywhere. This was seen with 1.0.1 and
+> 1.0.2's `202602` build on SketchUp 26.0, where `libSkpXyz` needs
+> `SUEnvironmentsSetSelectedEnvironment` and 26.0's `SketchUpAPI` doesn't export
+> it. A visible skip beats a silently broken install.
+>
+> To check a build against an install by hand on macOS:
+>
+> ```bash
+> nm -u <build>/lib/libSkpXyz.dylib | grep '^ *_SU' | sed 's/^ *//' | sort -u > /tmp/need
+> nm -gU "<SketchUp.app>/Contents/Frameworks/SketchUpAPI.framework/Versions/A/SketchUpAPI" \
+>   | awk '{print $NF}' | sort -u > /tmp/have
+> comm -23 /tmp/need /tmp/have   # any output = the plugin will not load
+> ```
 
 How the target tag is derived:
 

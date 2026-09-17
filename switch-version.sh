@@ -285,37 +285,42 @@ discover_sources() {
 
 # Pick the build matching a tag out of newline-separated candidates on stdin.
 # Preference order:
-#   1. exact tag match          (202602 install -> 202602 build)
-#   2. same SketchUp YEAR       (202600 install -> 202602 build)
-#   3. untagged/universal build (every release up to 0.8.3)
+#   1. exact tag match             (202602 install -> 202602 build)
+#   2. same YEAR, build minor <=   (202603 install -> 202602 build)
+#      the install's minor
+#   3. untagged/universal build    (every release up to 0.8.3)
 #
 # The minor in a build tag is the SketchUp version the build was compiled
-# against, NOT a requirement to match exactly: the SketchUp API is stable across
-# a release year, so the 202602 build installs into ANY SketchUp 26 (26.0, 26.1,
-# 26.2...). Matching the minor strictly would leave 26.0 with no installable
-# 1.0.0 build even though the 202602 one works there.
+# against, and it is a MINIMUM, not a label: a build compiled against 26.2 links
+# API symbols that earlier 26.x releases don't export, so it loads on 26.2+ but
+# NOT on 26.0. Installing it there looks like it works — the files copy fine —
+# but dyld rejects the plugin at load time and SketchUp silently drops the USD
+# entries from its Import/Export menus, leaving only the other exporters.
+# (Observed with 1.0.1/1.0.2's 202602 build on SketchUp 26.0: libSkpXyz.dylib
+# needs _SUEnvironmentsSetSelectedEnvironment, which 26.0's SketchUpAPI lacks.)
 #
-# Echoes nothing only when every candidate is tagged for a different YEAR: that
-# stays a hard failure, since a build linked against another release's SketchUp
-# API is exactly what this function exists to keep out.
+# So a build is only offered when its minor is <= the install's minor. Echoing
+# nothing is the correct answer for an install that is too old — a visible skip
+# beats a silently broken install.
 select_by_tag() {
-    local want="$1" cand untagged="" same_year="" tag
+    local want="$1" cand untagged="" best="" best_tag="" tag
     while IFS= read -r cand; do
         [[ -n "$cand" ]] || continue
         tag=$(build_tag_of "$cand")
         if [[ -n "$want" && "$tag" == "$want" ]]; then
             echo "$cand"; return 0
         fi
-        # Same release year, different minor — usable, but keep looking for an
-        # exact match first. Prefer the highest such build.
-        if [[ -n "$want" && -n "$tag" && "${tag:0:4}" == "${want:0:4}" ]]; then
-            if [[ -z "$same_year" || "$tag" > "$(build_tag_of "$same_year")" ]]; then
-                same_year="$cand"
+        # Same release year AND not newer than the install: usable. Keep the
+        # highest such build, but keep looking for an exact match first.
+        if [[ -n "$want" && -n "$tag" && "${tag:0:4}" == "${want:0:4}" ]] \
+            && (( 10#${tag:4:2} <= 10#${want:4:2} )); then
+            if [[ -z "$best" || "$tag" > "$best_tag" ]]; then
+                best="$cand"; best_tag="$tag"
             fi
         fi
         [[ -z "$tag" && -z "$untagged" ]] && untagged="$cand"
     done
-    [[ -n "$same_year" ]] && { echo "$same_year"; return 0; }
+    [[ -n "$best" ]] && { echo "$best"; return 0; }
     # Otherwise fall back to a universal (untagged) build if there is one.
     [[ -n "$untagged" ]] && { echo "$untagged"; return 0; }
     return 1
@@ -1039,7 +1044,9 @@ for SKETCHUP_APP in "${SKETCHUP_TARGETS[@]}"; do
             # A tagged install with no matching build must not fall back to a
             # build for another SketchUp API — skip it and keep going, so the
             # other selected apps still get installed.
-            echo "    SKIPPED: ${VERSIONS[$idx]} has no build for SketchUp ${app_tag:-(unknown)}." >&2
+            echo "    SKIPPED: ${VERSIONS[$idx]} has no build this SketchUp can load (needs ${app_tag:-(unknown)} or older)." >&2
+            echo "             A newer build links API symbols this SketchUp doesn't export;" >&2
+            echo "             installing it would silently drop the USD menu entries." >&2
             continue
         fi
     fi
