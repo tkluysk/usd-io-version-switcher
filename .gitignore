@@ -4,3 +4,5 @@ packages/
 .drive-cache/
 .venv/
 __pycache__/
+.claude/worktrees/
+.claude/settings.local.json
